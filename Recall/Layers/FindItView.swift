@@ -495,7 +495,8 @@ struct FindItView: View {
                 CLLocation(latitude: $0.latitude, longitude: $0.longitude)
             }
         }
-        return memory.breadcrumbs.map(\.location)
+        let confirmed = memory.breadcrumbs.filter { !$0.isEstimated }.map(\.location)
+        return confirmed.isEmpty ? memory.breadcrumbs.map(\.location) : confirmed
     }
     
     @discardableResult
@@ -749,27 +750,25 @@ struct BreadcrumbMapView: UIViewRepresentable {
         capturePin.title = memory.hasRefinedLocation ? "Refined capture location" : "Captured here"
         mapView.addAnnotation(capturePin)
         
-        var coords: [CLLocationCoordinate2D] = []
-        coords.append(targetCoordinate)
-        let trailCoords = memory.hasRefinedTrail
-            ? memory.refinedTrailCoordinates
-            : memory.breadcrumbs.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
-        coords.append(contentsOf: trailCoords)
-        if coords.count > 1 {
+        let trailSegments = trailCoordinateSegments()
+        for segment in trailSegments {
+            var coords = segment.coordinates
+            guard coords.count > 1 else { continue }
             let polyline = MKPolyline(coordinates: &coords, count: coords.count)
+            polyline.title = segment.containsEstimated ? "estimated" : "confirmed"
             mapView.addOverlay(polyline)
         }
         
         // Re-center when snap state changes
         if context.coordinator.lastSnappedState != isSnappedToMap {
             context.coordinator.lastSnappedState = isSnappedToMap
-            var allCoords = coords
+            var allCoords = [targetCoordinate] + trailSegments.flatMap(\.coordinates)
             allCoords.append(currentLocation.coordinate)
             let region = regionForCoordinates(allCoords)
             mapView.setRegion(region, animated: true)
         } else if !context.coordinator.hasSetRegion {
             context.coordinator.hasSetRegion = true
-            var allCoords = coords
+            var allCoords = [targetCoordinate] + trailSegments.flatMap(\.coordinates)
             allCoords.append(currentLocation.coordinate)
             mapView.setRegion(regionForCoordinates(allCoords), animated: false)
         }
@@ -797,9 +796,12 @@ struct BreadcrumbMapView: UIViewRepresentable {
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let polyline = overlay as? MKPolyline {
                 let renderer = MKPolylineRenderer(polyline: polyline)
-                renderer.strokeColor = UIColor.systemBlue.withAlphaComponent(0.7)
-                renderer.lineWidth = 3
-                renderer.lineDashPattern = [6, 4]
+                let isEstimated = polyline.title == "estimated"
+                renderer.strokeColor = isEstimated
+                    ? UIColor.systemOrange.withAlphaComponent(0.55)
+                    : UIColor.systemBlue.withAlphaComponent(0.7)
+                renderer.lineWidth = isEstimated ? 2 : 3
+                renderer.lineDashPattern = isEstimated ? [3, 5] : [6, 4]
                 return renderer
             }
             return MKOverlayRenderer(overlay: overlay)
@@ -846,6 +848,41 @@ struct BreadcrumbMapView: UIViewRepresentable {
     
     private var targetCoordinate: CLLocationCoordinate2D {
         memory.location.coordinate
+    }
+
+    private struct TrailSegment {
+        let coordinates: [CLLocationCoordinate2D]
+        let containsEstimated: Bool
+    }
+
+    private func trailCoordinateSegments() -> [TrailSegment] {
+        if memory.hasRefinedTrail {
+            return [TrailSegment(coordinates: memory.refinedTrailCoordinates, containsEstimated: false)]
+        }
+
+        var segments: [TrailSegment] = []
+        var current: [CLLocationCoordinate2D] = []
+        var currentSegmentID: UUID?
+        var hasEstimated = false
+
+        for crumb in memory.breadcrumbs {
+            let crumbSegmentID = crumb.segmentID
+            if !current.isEmpty, crumbSegmentID != currentSegmentID {
+                segments.append(TrailSegment(coordinates: current, containsEstimated: hasEstimated))
+                current = []
+                hasEstimated = false
+            }
+
+            current.append(CLLocationCoordinate2D(latitude: crumb.latitude, longitude: crumb.longitude))
+            currentSegmentID = crumbSegmentID
+            hasEstimated = hasEstimated || crumb.isEstimated
+        }
+
+        if !current.isEmpty {
+            segments.append(TrailSegment(coordinates: current, containsEstimated: hasEstimated))
+        }
+
+        return segments
     }
 }
 // MARK: - Haptic Direction Manager

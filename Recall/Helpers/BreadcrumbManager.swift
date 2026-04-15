@@ -10,6 +10,7 @@ import CoreLocation
 import Combine
 import SwiftData
 
+@MainActor
 class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     static let shared = BreadcrumbManager()
     
@@ -28,12 +29,18 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     private let manager = CLLocationManager()
     private let confidenceManager = LocationConfidenceManager.shared
     private let navigationStateManager = NavigationStateManager.shared
+    private let deadReckoner = MotionDeadReckoner()
     private var activeMemory: MemoryNode?
     private var lastRecordedLocation: CLLocation?
     private var lastRecordedAltitude: Double?
     private var stopTimer: Timer?
     private var modelContext: ModelContext?
     private var totalTrackedDistance: Double = 0
+    private var currentSegmentID: UUID = UUID()
+    private var poorSignalStartedAt: Date?
+    private var pendingReliableSamples: Int = 0
+    private var lastDeadReckonedDistance: Double = 0
+    private var lastModeRecoveryAt: Date = .distantPast
     
     @Published private(set) var activeMemoryID: UUID?
     @Published private(set) var isTracking = false
@@ -47,10 +54,17 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     private let poorAccuracyThreshold: Double = 28 // clearly poor GPS
     private let maxBreadcrumbAccuracy: Double = 65 // drop very noisy crumbs
     private let maxHumanWalkingSpeed: Double = 4.5 // speed sanity
-    private let maxSingleJumpDistance: Double = 50 // jump rejection
+    private let maxSingleJumpDistance: Double = 35 // jump rejection
     private let minDistanceReliable: Double = 10
     private let minDistanceDegrading: Double = 6
     private let minDistanceUnreliable: Double = 4
+    private let minRecoverySamples = 2
+    private let segmentBreakAfterPoorSignal: TimeInterval = 18
+    private let maxDeadReckoningDuration: TimeInterval = 25
+    private let minDeadReckoningStepDistance: Double = 3
+    private let maxDeadReckoningStepDistance: Double = 8
+    private let postRecoverySegmentHold: TimeInterval = 8
+    private let minDisplacementForSegmentBreak: Double = 12
     
     override init() {
         super.init()
@@ -67,6 +81,11 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         self.lastRecordedLocation = memory.originalLocation
         self.lastRecordedAltitude = memory.captureAltitude
         self.totalTrackedDistance = 0
+        self.currentSegmentID = UUID()
+        self.poorSignalStartedAt = nil
+        self.pendingReliableSamples = 0
+        self.lastDeadReckonedDistance = 0
+        self.lastModeRecoveryAt = .distantPast
         self.activeMemoryID = memory.id
         self.isTracking = true
         self.trackedDistance = 0
@@ -77,10 +96,15 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         
         manager.startUpdatingLocation()
         manager.startUpdatingHeading()
+        deadReckoner.start()
+        deadReckoner.resetAnchor()
         
         // Auto stop after 20 minutes
         stopTimer = Timer.scheduledTimer(withTimeInterval: maxDuration, repeats: false) { [weak self] _ in
-            self?.stop(reason: .timeCap)
+            guard let self else { return }
+            Task { @MainActor [self] in
+                self.stop(reason: .timeCap)
+            }
         }
         
         print("BreadcrumbManager: started for memory \(memory.id)")
@@ -95,6 +119,12 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         lastRecordedLocation = nil
         lastRecordedAltitude = nil
         totalTrackedDistance = 0
+        currentSegmentID = UUID()
+        poorSignalStartedAt = nil
+        pendingReliableSamples = 0
+        lastDeadReckonedDistance = 0
+        lastModeRecoveryAt = .distantPast
+        deadReckoner.stop()
         activeMemoryID = nil
         isTracking = false
         trackedDistance = 0
@@ -109,9 +139,74 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
               let lastLocation = lastRecordedLocation,
               let memory = activeMemory,
               let context = modelContext else { return }
-        
+        processLocationUpdate(
+            newLocation: newLocation,
+            lastLocation: lastLocation,
+            memory: memory,
+            context: context,
+            headingFromManager: manager.heading?.trueHeading
+        )
+    }
+
+#if DEBUG
+    func ingestSimulatedLocation(_ newLocation: CLLocation, heading: CLLocationDirection? = nil) {
+        guard let lastLocation = lastRecordedLocation,
+              let memory = activeMemory,
+              let context = modelContext else { return }
+        processLocationUpdate(
+            newLocation: newLocation,
+            lastLocation: lastLocation,
+            memory: memory,
+            context: context,
+            headingFromManager: heading
+        )
+    }
+
+    func ingestSimulatedEstimatedMovement(distanceMeters: Double, heading: CLLocationDirection) {
+        guard let anchor = lastRecordedLocation,
+              let memory = activeMemory,
+              let context = modelContext else { return }
+        guard distanceMeters >= minDeadReckoningStepDistance else { return }
+
+        enterPoorSignalState()
+        let projectedCoordinate = projectCoordinate(
+            from: anchor.coordinate,
+            headingDegrees: heading,
+            distanceMeters: min(distanceMeters, maxDeadReckoningStepDistance)
+        )
+        let estimatedLocation = CLLocation(latitude: projectedCoordinate.latitude, longitude: projectedCoordinate.longitude)
+        let verticalDelta: Double? = {
+            guard let lastRecordedAltitude else { return nil }
+            return anchor.altitude - lastRecordedAltitude
+        }()
+        let crumb = BreadcrumbPoint(
+            latitude: projectedCoordinate.latitude,
+            longitude: projectedCoordinate.longitude,
+            heading: heading,
+            stepDistance: min(distanceMeters, maxDeadReckoningStepDistance),
+            horizontalAccuracy: nil,
+            speed: nil,
+            course: nil,
+            altitude: anchor.altitude,
+            verticalAccuracy: nil,
+            verticalDelta: verticalDelta,
+            confidenceScore: 0.22,
+            segmentID: currentSegmentID,
+            isEstimated: true
+        )
+        appendCrumb(crumb, at: estimatedLocation, distanceMoved: crumb.stepDistance, memory: memory, context: context)
+    }
+#endif
+
+    private func processLocationUpdate(
+        newLocation: CLLocation,
+        lastLocation: CLLocation,
+        memory: MemoryNode,
+        context: ModelContext,
+        headingFromManager: CLLocationDirection?
+    ) {
         let horizontalAccuracy = newLocation.horizontalAccuracy
-        let currentHeading = manager.heading?.trueHeading ?? -1
+        let currentHeading = headingFromManager ?? -1
         confidenceManager.ingest(newLocation)
         navigationStateManager.updateMode(from: confidenceManager.currentConfidence)
         let navigationMode = navigationStateManager.currentMode
@@ -127,12 +222,22 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         
         let distanceMoved = newLocation.distance(from: lastLocation)
         let speed = newLocation.speed
-        
-        // Keep heading/GPS recovery logic active, but reject clearly noisy breadcrumb points.
-        guard newLocation.horizontalAccuracy > 0,
-              newLocation.horizontalAccuracy <= maxBreadcrumbAccuracy else { return }
-        guard speed < 0 || speed <= maxHumanWalkingSpeed else { return }
-        guard distanceMoved <= maxSingleJumpDistance else { return }
+
+        let hasAcceptableAccuracy = newLocation.horizontalAccuracy > 0 && newLocation.horizontalAccuracy <= maxBreadcrumbAccuracy
+        let hasAcceptableSpeed = speed < 0 || speed <= maxHumanWalkingSpeed
+        let hasAcceptableJump = distanceMoved <= maxSingleJumpDistance
+        let isValidGPSCrumb = hasAcceptableAccuracy && hasAcceptableSpeed && hasAcceptableJump
+
+        guard isValidGPSCrumb else {
+            enterPoorSignalState()
+            maybeRecordDeadReckonedCrumb(
+                from: lastLocation,
+                memory: memory,
+                context: context,
+                fallbackHeading: currentHeading
+            )
+            return
+        }
         
         let minimumDistanceForMode: Double
         switch navigationMode {
@@ -143,7 +248,32 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         case .gpsUnreliable:
             minimumDistanceForMode = minDistanceUnreliable
         }
-        guard distanceMoved >= minimumDistanceForMode else { return }
+        guard distanceMoved >= minimumDistanceForMode else {
+            if trackingState == .trackingPoorGPS {
+                pendingReliableSamples = min(minRecoverySamples, pendingReliableSamples + 1)
+            }
+            return
+        }
+
+        if trackingState == .trackingPoorGPS {
+            pendingReliableSamples += 1
+            if pendingReliableSamples < minRecoverySamples {
+                return
+            }
+            let poorDuration = Date().timeIntervalSince(poorSignalStartedAt ?? .distantPast)
+            let cooldownElapsed = Date().timeIntervalSince(lastModeRecoveryAt)
+            let shouldBreakForTime = poorDuration >= segmentBreakAfterPoorSignal
+            let shouldBreakForDisplacement = distanceMoved >= minDisplacementForSegmentBreak
+            if cooldownElapsed >= postRecoverySegmentHold && (shouldBreakForTime || shouldBreakForDisplacement) {
+                currentSegmentID = UUID()
+            }
+            trackingState = .trackingNormal
+            poorSignalStartedAt = nil
+            pendingReliableSamples = 0
+            deadReckoner.resetAnchor()
+            lastDeadReckonedDistance = 0
+            lastModeRecoveryAt = Date()
+        }
         
         let heading = currentHeading >= 0 ? currentHeading : 0
         let verticalDelta: Double? = {
@@ -169,22 +299,116 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             altitude: newLocation.altitude,
             verticalAccuracy: newLocation.verticalAccuracy > 0 ? newLocation.verticalAccuracy : nil,
             verticalDelta: verticalDelta,
-            confidenceScore: confidenceScore
+            confidenceScore: confidenceScore,
+            segmentID: currentSegmentID,
+            isEstimated: false
         )
-        
-        memory.breadcrumbs.append(crumb)
-        totalTrackedDistance += distanceMoved
-        trackedDistance = totalTrackedDistance
-        try? context.save()
-        
-        lastRecordedLocation = newLocation
-        lastRecordedAltitude = newLocation.altitude
-        print("Breadcrumb recorded: \(memory.breadcrumbs.count) total")
+        appendCrumb(crumb, at: newLocation, distanceMoved: distanceMoved, memory: memory, context: context)
         
         if totalTrackedDistance >= maxTrailDistance {
             print("BreadcrumbManager: stopped after distance cap \(Int(totalTrackedDistance))m")
             stop(reason: .distanceCap)
         }
+    }
+
+    private func enterPoorSignalState() {
+        if trackingState != .trackingPoorGPS {
+            trackingState = .trackingPoorGPS
+            currentSegmentID = UUID()
+            poorSignalStartedAt = Date()
+            pendingReliableSamples = 0
+            deadReckoner.resetAnchor()
+            lastDeadReckonedDistance = 0
+        }
+    }
+
+    private func maybeRecordDeadReckonedCrumb(
+        from anchorLocation: CLLocation,
+        memory: MemoryNode,
+        context: ModelContext,
+        fallbackHeading: CLLocationDirection
+    ) {
+        guard let poorSignalStartedAt else { return }
+        guard Date().timeIntervalSince(poorSignalStartedAt) <= maxDeadReckoningDuration else { return }
+        guard deadReckoner.isRunning else { return }
+
+        let estimatedDistance = deadReckoner.distanceSinceAnchor
+        let distanceDelta = estimatedDistance - lastDeadReckonedDistance
+        guard distanceDelta >= minDeadReckoningStepDistance, distanceDelta <= maxDeadReckoningStepDistance else { return }
+
+        let heading = deadReckoner.headingDegrees ?? (fallbackHeading >= 0 ? fallbackHeading : 0)
+        guard deadReckoner.headingStdDev <= 45 else { return }
+
+        let projectedCoordinate = projectCoordinate(
+            from: anchorLocation.coordinate,
+            headingDegrees: heading,
+            distanceMeters: distanceDelta
+        )
+        let estimatedLocation = CLLocation(latitude: projectedCoordinate.latitude, longitude: projectedCoordinate.longitude)
+        let verticalDelta: Double? = {
+            guard let lastRecordedAltitude else { return nil }
+            return anchorLocation.altitude - lastRecordedAltitude
+        }()
+        let crumb = BreadcrumbPoint(
+            latitude: projectedCoordinate.latitude,
+            longitude: projectedCoordinate.longitude,
+            heading: heading,
+            stepDistance: distanceDelta,
+            horizontalAccuracy: nil,
+            speed: nil,
+            course: nil,
+            altitude: anchorLocation.altitude,
+            verticalAccuracy: nil,
+            verticalDelta: verticalDelta,
+            confidenceScore: 0.25,
+            segmentID: currentSegmentID,
+            isEstimated: true
+        )
+        appendCrumb(crumb, at: estimatedLocation, distanceMoved: distanceDelta, memory: memory, context: context)
+        lastDeadReckonedDistance = estimatedDistance
+    }
+
+    private func appendCrumb(
+        _ crumb: BreadcrumbPoint,
+        at location: CLLocation,
+        distanceMoved: Double,
+        memory: MemoryNode,
+        context: ModelContext
+    ) {
+        memory.breadcrumbs.append(crumb)
+        totalTrackedDistance += max(0, distanceMoved)
+        trackedDistance = totalTrackedDistance
+        try? context.save()
+
+        lastRecordedLocation = location
+        lastRecordedAltitude = location.altitude
+        print("Breadcrumb recorded: \(memory.breadcrumbs.count) total")
+    }
+
+    private func projectCoordinate(
+        from coordinate: CLLocationCoordinate2D,
+        headingDegrees: Double,
+        distanceMeters: Double
+    ) -> CLLocationCoordinate2D {
+        let earthRadius = 6_371_000.0
+        let bearing = headingDegrees * .pi / 180
+        let lat1 = coordinate.latitude * .pi / 180
+        let lon1 = coordinate.longitude * .pi / 180
+        let angularDistance = distanceMeters / earthRadius
+
+        let lat2 = asin(
+            sin(lat1) * cos(angularDistance) +
+            cos(lat1) * sin(angularDistance) * cos(bearing)
+        )
+        let lon2 = lon1 + atan2(
+            sin(bearing) * sin(angularDistance) * cos(lat1),
+            cos(angularDistance) - sin(lat1) * sin(lat2)
+        )
+
+        return CLLocationCoordinate2D(
+            latitude: lat2 * 180 / .pi,
+            longitude: lon2 * 180 / .pi
+        )
     }
 
     private func crumbConfidenceScore(

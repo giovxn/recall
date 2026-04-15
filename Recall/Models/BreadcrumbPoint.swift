@@ -22,6 +22,8 @@ class BreadcrumbPoint {
     var verticalAccuracy: Double?
     var verticalDelta: Double?
     var confidenceScore: Double?
+    var segmentID: UUID?
+    var isEstimated: Bool
     var timestamp: Date
     
     init(
@@ -35,7 +37,9 @@ class BreadcrumbPoint {
         altitude: Double? = nil,
         verticalAccuracy: Double? = nil,
         verticalDelta: Double? = nil,
-        confidenceScore: Double? = nil
+        confidenceScore: Double? = nil,
+        segmentID: UUID? = nil,
+        isEstimated: Bool = false
     ) {
         self.latitude = latitude
         self.longitude = longitude
@@ -48,6 +52,8 @@ class BreadcrumbPoint {
         self.verticalAccuracy = verticalAccuracy
         self.verticalDelta = verticalDelta
         self.confidenceScore = confidenceScore
+        self.segmentID = segmentID
+        self.isEstimated = isEstimated
         self.timestamp = Date()
     }
     

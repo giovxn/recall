@@ -18,6 +18,7 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     @Published private(set) var recentLocations: [CLLocation] = []
     
     private let recentWindowSeconds: TimeInterval = 4
+    private let captureTargetAccuracy: Double = 20
     
     override init() {
         super.init()
@@ -100,5 +101,64 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             speed: top.first?.speed ?? -1,
             timestamp: Date()
         )
+    }
+
+    func isGoodCaptureFix(_ location: CLLocation) -> Bool {
+        location.horizontalAccuracy > 0 && location.horizontalAccuracy <= captureTargetAccuracy
+    }
+
+    func refineCaptureLocation(
+        initialLocation: CLLocation,
+        timeout: TimeInterval = 8,
+        tickInterval: TimeInterval = 1,
+        completion: @escaping (_ bestLocation: CLLocation, _ isHighConfidence: Bool) -> Void
+    ) {
+        let captureTime = Date()
+        let deadline = captureTime.addingTimeInterval(timeout)
+
+        func score(_ location: CLLocation, reference: CLLocation) -> Double {
+            guard location.horizontalAccuracy > 0 else { return .greatestFiniteMagnitude }
+            let freshnessPenalty = max(0, captureTime.timeIntervalSince(location.timestamp)) * 2.0
+            let driftPenalty = min(location.distance(from: reference), 20) * 0.5
+            return location.horizontalAccuracy + freshnessPenalty + driftPenalty
+        }
+
+        func bestCandidate(reference: CLLocation) -> CLLocation {
+            let now = Date()
+            let candidates = recentLocations.filter {
+                $0.horizontalAccuracy > 0 &&
+                abs($0.timestamp.timeIntervalSince(captureTime)) <= timeout &&
+                now.timeIntervalSince($0.timestamp) <= timeout + 1
+            }
+            guard !candidates.isEmpty else { return reference }
+            return candidates.min { score($0, reference: reference) < score($1, reference: reference) } ?? reference
+        }
+
+        func finalize(with location: CLLocation) {
+            DispatchQueue.main.async {
+                completion(location, self.isGoodCaptureFix(location))
+            }
+        }
+
+        let seed = bestRecentLocation() ?? initialLocation
+        if isGoodCaptureFix(seed) {
+            finalize(with: seed)
+            return
+        }
+
+        func poll() {
+            let best = bestCandidate(reference: initialLocation)
+            if isGoodCaptureFix(best) || Date() >= deadline {
+                finalize(with: best)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + tickInterval) {
+                poll()
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + tickInterval) {
+            poll()
+        }
     }
 }

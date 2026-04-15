@@ -87,8 +87,10 @@ struct CaptureView: View {
             )
             memory.captureAltitude = location.altitude
             memory.captureVerticalAccuracy = location.verticalAccuracy > 0 ? location.verticalAccuracy : nil
+            memory.refinementMode = locationManager.isGoodCaptureFix(location) ? "none" : "pending"
             
             modelContext.insert(memory)
+            try? modelContext.save()
             
             // Run Vision analysis in background
             VisionAnalyzer.shared.analyze(imageData: imageData) { analysis in
@@ -101,6 +103,7 @@ struct CaptureView: View {
             
             BreadcrumbManager.shared.start(for: memory, context: modelContext)
             LiveActivityManager.shared.startActivity(memory: memory, arrow: "↑", distance: "Calculating...")
+            refinePendingLocation(for: memory, initialLocation: location)
             
             withAnimation {
                 showSavedFeedback = true
@@ -108,6 +111,18 @@ struct CaptureView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 withAnimation { showSavedFeedback = false }
             }
+        }
+    }
+
+    private func refinePendingLocation(for memory: MemoryNode, initialLocation: CLLocation) {
+        locationManager.refineCaptureLocation(initialLocation: initialLocation, timeout: 8) { refinedLocation, isHighConfidence in
+            memory.refinedLatitude = refinedLocation.coordinate.latitude
+            memory.refinedLongitude = refinedLocation.coordinate.longitude
+            memory.gpsRecoveredAt = Date()
+            memory.gpsRecoveredLatitude = refinedLocation.coordinate.latitude
+            memory.gpsRecoveredLongitude = refinedLocation.coordinate.longitude
+            memory.refinementMode = isHighConfidence ? "committed" : "fallback"
+            try? modelContext.save()
         }
     }
     
