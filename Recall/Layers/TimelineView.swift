@@ -18,6 +18,10 @@ struct TimelineView: View {
     @Query(sort: \MemoryNode.timestamp, order: .reverse) private var memories: [MemoryNode]
     @StateObject private var locationManager = LocationManager()
     @State private var showManualMemorySheet = false
+#if DEBUG
+    @State private var isRunningSimulation = false
+    @State private var simulationStatus: String?
+#endif
     
     var body: some View {
         NavigationStack {
@@ -54,13 +58,33 @@ struct TimelineView: View {
                     } label: {
                         Image(systemName: "plus")
                     }
-                    
-                    Button {
-                        createDebugMemory()
+#if DEBUG
+                    Menu {
+                        Button("Create static debug memory") {
+                            createDebugMemory()
+                        }
+                        Divider()
+                        Button("Run 40m simulation (good GPS)") {
+                            runDebugSimulation(.good)
+                        }
+                        .disabled(isRunningSimulation)
+                        Button("Run 40m simulation (mixed GPS)") {
+                            runDebugSimulation(.mixed)
+                        }
+                        .disabled(isRunningSimulation)
+                        Button("Run 40m simulation (poor GPS)") {
+                            runDebugSimulation(.poor)
+                        }
+                        .disabled(isRunningSimulation)
                     } label: {
-                        Label("Debug", systemImage: "ant.fill")
+                        if isRunningSimulation {
+                            Label("Running", systemImage: "dot.radiowaves.left.and.right")
+                        } else {
+                            Label("Debug", systemImage: "ant.fill")
+                        }
                     }
                     .tint(.orange)
+#endif
                 }
             }
         }
@@ -71,6 +95,19 @@ struct TimelineView: View {
             locationManager.requestPermission()
             locationManager.startUpdating()
         }
+#if DEBUG
+        .safeAreaInset(edge: .bottom) {
+            if let simulationStatus {
+                Text(simulationStatus)
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(0.65), in: Capsule())
+                    .foregroundStyle(.white)
+                    .padding(.bottom, 10)
+            }
+        }
+#endif
     }
     
     // Creates a fake memory 80m north of your current location
@@ -130,6 +167,271 @@ struct TimelineView: View {
             modelContext.delete(memories[index])
         }
     }
+
+#if DEBUG
+    private enum SimulationProfile {
+        case good
+        case mixed
+        case poor
+
+        var label: String {
+            switch self {
+            case .good: return "good GPS"
+            case .mixed: return "mixed GPS"
+            case .poor: return "poor GPS"
+            }
+        }
+
+        var baseAccuracy: Double {
+            switch self {
+            case .good: return 8
+            case .mixed: return 24
+            case .poor: return 55
+            }
+        }
+    }
+
+    private func runDebugSimulation(_ profile: SimulationProfile) {
+        guard !isRunningSimulation else { return }
+        guard let start = locationManager.currentLocation else {
+            simulationStatus = "Simulation failed: no current location"
+            return
+        }
+        isRunningSimulation = true
+        simulationStatus = "Running turn-route simulation (\(profile.label))..."
+
+        let memory = makeSimulationMemory(from: start, profile: profile)
+        modelContext.insert(memory)
+        try? modelContext.save()
+        let headings = simulationRouteHeadings()
+        let stepDistance = 4.5
+        let startTime = Date()
+        BreadcrumbManager.shared.start(for: memory, context: modelContext)
+        runSimulationStep(
+            step: 1,
+            routeHeadings: headings,
+            currentLocation: start,
+            memory: memory,
+            profile: profile,
+            stepDistance: stepDistance,
+            startTime: startTime
+        )
+    }
+
+    private func runSimulationStep(
+        step: Int,
+        routeHeadings: [Double],
+        currentLocation: CLLocation,
+        memory: MemoryNode,
+        profile: SimulationProfile,
+        stepDistance: Double,
+        startTime: Date
+    ) {
+        guard step <= routeHeadings.count else {
+            let elapsed = Int(Date().timeIntervalSince(startTime))
+            simulationStatus = simulationSummary(memory: memory, elapsedSeconds: elapsed, profile: profile)
+            BreadcrumbManager.shared.stop(reason: .manual)
+            isRunningSimulation = false
+            try? modelContext.save()
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            let heading = routeHeadings[step - 1]
+            let nextLocation = simulatedNextLocation(
+                from: currentLocation,
+                headingDegrees: heading,
+                distanceMeters: stepDistance,
+                accuracyMeters: simulatedAccuracy(for: profile, step: step, totalSteps: routeHeadings.count)
+            )
+
+            // Simulate occasional GPS loss under mixed/poor conditions.
+            let shouldDropSignal = shouldDropSignal(for: profile, step: step, totalSteps: routeHeadings.count)
+            if !shouldDropSignal {
+                BreadcrumbManager.shared.ingestSimulatedLocation(nextLocation, heading: heading)
+            } else {
+                if shouldEmitEstimatedCrumb(for: profile, step: step) {
+                let estimatedHeading = simulatedEstimatedHeading(
+                    profile: profile,
+                    trueHeading: heading,
+                    step: step,
+                    totalSteps: routeHeadings.count
+                )
+                BreadcrumbManager.shared.ingestSimulatedEstimatedMovement(
+                    distanceMeters: stepDistance * 0.92,
+                    heading: estimatedHeading
+                )
+                }
+            }
+
+            runSimulationStep(
+                step: step + 1,
+                routeHeadings: routeHeadings,
+                currentLocation: nextLocation,
+                memory: memory,
+                profile: profile,
+                stepDistance: stepDistance,
+                startTime: startTime
+            )
+        }
+    }
+
+    private func makeSimulationMemory(from location: CLLocation, profile: SimulationProfile) -> MemoryNode {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
+        let image = renderer.image { ctx in
+            UIColor.darkGray.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 320, height: 320))
+            let text = "SIM \(profile.label.uppercased())" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 28),
+                .foregroundColor: UIColor.white
+            ]
+            text.draw(at: CGPoint(x: 20, y: 140), withAttributes: attrs)
+        }
+        let memory = MemoryNode(
+            imageData: image.jpegData(compressionQuality: 0.82) ?? Data(),
+            latitude: location.coordinate.latitude,
+            longitude: location.coordinate.longitude,
+            heading: 0,
+            captureHorizontalAccuracy: profile.baseAccuracy
+        )
+        memory.smartLabel = "Simulation - \(profile.label)"
+        memory.classification = "place"
+        memory.refinementMode = "none"
+        return memory
+    }
+
+    private func simulationRouteHeadings() -> [Double] {
+        // Pattern: straight, left, straight, right, straight, right, straight, left, straight.
+        // Repeat each segment twice and run two cycles for a longer walking scenario.
+        let basePattern: [Double] = [0, 90, 0, 270, 0, 270, 0, 90, 0]
+        let singleCycle = basePattern.flatMap { heading in [heading, heading] }
+        return singleCycle + singleCycle
+    }
+
+    private func simulatedAccuracy(for profile: SimulationProfile, step: Int, totalSteps: Int) -> Double {
+        let progress = Double(step) / Double(max(totalSteps, 1))
+        switch profile {
+        case .good:
+            let wobble = Double((step % 5) - 2)
+            return max(5, 8 + wobble)
+        case .mixed:
+            // Gradually improves from degraded GPS to near-good by end of walk.
+            let baseline = 36 - (progress * 14) // ~36m -> ~22m
+            let wobble = Double((step % 6) - 3) * 2
+            return max(15, baseline + wobble)
+        case .poor:
+            // Starts very noisy, then recovers late in the walk.
+            let baseline = 72 - (progress * 42) // ~72m -> ~30m
+            let wobble = Double((step % 7) - 3) * 3
+            return max(18, baseline + wobble)
+        }
+    }
+
+    private func shouldDropSignal(for profile: SimulationProfile, step: Int, totalSteps: Int) -> Bool {
+        let progress = Double(step) / Double(max(totalSteps, 1))
+        switch profile {
+        case .good:
+            return false
+        case .mixed:
+            if progress < 0.35 { return [5, 9, 12].contains(step) }
+            if progress < 0.7 { return [18, 23].contains(step) }
+            return false
+        case .poor:
+            if progress < 0.5 { return [4, 5, 8, 9, 12, 13, 16].contains(step) }
+            if progress < 0.8 { return [22, 25, 28].contains(step) }
+            return false
+        }
+    }
+
+    private func simulationSummary(memory: MemoryNode, elapsedSeconds: Int, profile: SimulationProfile) -> String {
+        let crumbs = memory.breadcrumbs.count
+        let estimated = memory.breadcrumbs.filter(\.isEstimated).count
+        let segmentCount = Set(memory.breadcrumbs.compactMap(\.segmentID)).count
+        let maxJump = memory.breadcrumbs.map(\.stepDistance).max() ?? 0
+        return "Done \(profile.label): \(crumbs) crumbs, \(estimated) est, \(max(segmentCount, 1)) segments, max jump \(Int(maxJump))m, \(elapsedSeconds)s"
+    }
+
+    private func simulatedEstimatedHeading(profile: SimulationProfile, trueHeading: Double, step: Int, totalSteps: Int) -> Double {
+        let progress = Double(step) / Double(max(totalSteps, 1))
+        switch profile {
+        case .good:
+            return trueHeading
+        case .mixed:
+            let offsets: [Double] = [-8, -4, 0, 4, 7]
+            return normalizeHeading(trueHeading + offsets[step % offsets.count])
+        case .poor:
+            let offsets: [Double] = progress < 0.7
+                ? [-16, -10, -5, 0, 6, 11, 15]
+                : [-10, -6, -3, 0, 4, 7, 9]
+            return normalizeHeading(trueHeading + offsets[step % offsets.count])
+        }
+    }
+
+    private func shouldEmitEstimatedCrumb(for profile: SimulationProfile, step: Int) -> Bool {
+        switch profile {
+        case .good:
+            return false
+        case .mixed:
+            return true
+        case .poor:
+            // Reduce zig-zag density in worst profile.
+            return step.isMultiple(of: 2)
+        }
+    }
+
+    private func normalizeHeading(_ value: Double) -> Double {
+        var normalized = value.truncatingRemainder(dividingBy: 360)
+        if normalized < 0 { normalized += 360 }
+        return normalized
+    }
+
+    private func simulatedNextLocation(
+        from location: CLLocation,
+        headingDegrees: Double,
+        distanceMeters: Double,
+        accuracyMeters: Double
+    ) -> CLLocation {
+        let coordinate = projectedCoordinate(
+            from: location.coordinate,
+            headingDegrees: headingDegrees,
+            distanceMeters: distanceMeters
+        )
+        return CLLocation(
+            coordinate: coordinate,
+            altitude: location.altitude,
+            horizontalAccuracy: accuracyMeters,
+            verticalAccuracy: max(location.verticalAccuracy, 8),
+            course: headingDegrees,
+            speed: 1.5,
+            timestamp: Date()
+        )
+    }
+
+    private func projectedCoordinate(
+        from coordinate: CLLocationCoordinate2D,
+        headingDegrees: Double,
+        distanceMeters: Double
+    ) -> CLLocationCoordinate2D {
+        let earthRadius = 6_371_000.0
+        let bearing = headingDegrees * .pi / 180
+        let lat1 = coordinate.latitude * .pi / 180
+        let lon1 = coordinate.longitude * .pi / 180
+        let angularDistance = distanceMeters / earthRadius
+        let lat2 = asin(
+            sin(lat1) * cos(angularDistance) +
+            cos(lat1) * sin(angularDistance) * cos(bearing)
+        )
+        let lon2 = lon1 + atan2(
+            sin(bearing) * sin(angularDistance) * cos(lat1),
+            cos(angularDistance) - sin(lat1) * sin(lat2)
+        )
+        return CLLocationCoordinate2D(
+            latitude: lat2 * 180 / .pi,
+            longitude: lon2 * 180 / .pi
+        )
+    }
+#endif
 }
 
 struct MemoryRow: View {
