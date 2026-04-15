@@ -1,0 +1,459 @@
+// V1 Desing
+// Show map preview but end to end edge
+
+import SwiftUI
+import MapKit
+import CoreLocation
+import UIKit
+
+struct FindItView: View {
+    let memory: MemoryNode
+    @StateObject private var locationManager = LocationManager()
+    
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                if let image = UIImage(data: memory.imageData) {
+                    ZStack(alignment: .top) {
+                        
+                        // LAYER 1 — Sharp image, full natural height, scrolls with content
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity)
+                            .ignoresSafeArea(edges: .horizontal)
+                            .ignoresSafeArea(edges: .top)
+                            .offset(y: -355)
+                            
+                        // LAYER 2 — Mirrored blurred image on top, fades from opaque at bottom to transparent at top
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 920)
+                            .scaleEffect(x: 1, y: -1)
+                            .blur(radius: 40)
+                            .scaleEffect(1.1)
+                            .brightness(-0.3)
+                            .clipped()
+                            .offset(y: 250)
+                            .mask(
+                                VStack(spacing: 0) {
+                                    // Transparent at top — reveals sharp image underneath
+                                    LinearGradient(
+                                        colors: [.clear, .clear, .black],
+                                        startPoint: .top,
+                                        endPoint: .bottom
+                                    )
+                                    .frame(height: 450)
+                                    
+                                    // Fully opaque at bottom
+                                    Rectangle()
+                                        .frame(height: 420)
+                                }
+                            )
+                        
+                        // LAYER 3 — Content
+                        VStack(spacing: 0) {
+                            Color.clear.frame(height: 300)
+                            
+                            if let currentLocation = locationManager.currentLocation {
+                                let savedLocation = memory.location
+                                let bearing = DirectionHelper.bearing(from: currentLocation, to: savedLocation)
+                                let heading = locationManager.currentHeading?.trueHeading ?? 0
+                                let distance = DirectionHelper.distance(from: currentLocation, to: savedLocation)
+                                let distanceStr = DirectionHelper.distanceString(from: currentLocation, to: savedLocation)
+                                let rotationAngle = bearing - heading
+                                
+                                let _ = { HapticDirectionManager.shared.update(angleDiff: rotationAngle, distance: distance) }()
+                                
+                                VStack(spacing: 24) {
+                                    TrackerView(distance: distance, rotationAngle: rotationAngle)
+                                        .frame(width: 200, height: 200)
+                                        .padding(.top, 16)
+                                    
+                                    VStack(spacing: 6) {
+                                        Text(distanceStr)
+                                            .font(.system(size: 36, weight: .bold, design: .rounded))
+                                            .foregroundStyle(proximityColor(distance: distance))
+                                        Text(proximityLabel(distance: distance))
+                                            .font(.system(size: 14, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.7))
+                                    }
+                                    
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 16)
+                                            .fill(Color.black)
+                                        HStack {
+                                            Spacer().frame(width: 16)
+                                            
+                                            BreadcrumbMapView(memory: memory, currentLocation: currentLocation)
+                                                .frame(height: 280)
+                                                .cornerRadius(16)
+                                                .overlay(
+                                                    RoundedRectangle(cornerRadius: 16)
+                                                        .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                                                )
+                                            
+                                            Spacer().frame(width: 16)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 280)
+                                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 16)
+                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                                    )
+                                    .padding(.horizontal, 16)
+                                }
+                                .onChange(of: distanceStr) {
+                                    LiveActivityManager.shared.updateActivity(
+                                        arrow: DirectionHelper.relativeArrow(bearing: bearing, currentHeading: heading),
+                                        distance: distanceStr
+                                    )
+                                }
+                                
+                            } else {
+                                VStack(spacing: 12) {
+                                    ProgressView().tint(.white)
+                                    Text("Getting location...")
+                                        .foregroundStyle(.white.opacity(0.7))
+                                }
+                                .padding(.top, 60)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+        }
+        .ignoresSafeArea(edges: .top)
+        .toolbar(.hidden, for: .tabBar) // hide tab bar on this screen
+        .onAppear {
+            locationManager.requestPermission()
+            locationManager.startUpdating()
+        }
+        .onDisappear {
+            locationManager.stopUpdating()
+            HapticDirectionManager.shared.stop()
+        }
+    }
+    
+    private func proximityColor(distance: Double) -> Color {
+        switch distance {
+        case 0..<15:    return .green
+        case 15..<50:   return Color(red: 0.4, green: 0.8, blue: 0.2)
+        case 50..<100:  return .yellow
+        case 100..<200: return .orange
+        default:        return .red
+        }
+    }
+    
+    private func proximityLabel(distance: Double) -> String {
+        switch distance {
+        case 0..<5:     return "You're right there!"
+        case 5..<15:    return "Very close"
+        case 15..<50:   return "Getting closer"
+        case 50..<100:  return "Nearby"
+        case 100..<300: return "Keep walking"
+        default:        return "Far away"
+        }
+    }
+}
+
+// MARK: - Tracker View (isolated — heading updates only re-render this)
+struct TrackerView: View {
+    let distance: Double
+    let rotationAngle: Double
+    
+    @State private var smoothedAngle: Double = 0
+    @State private var arrowScale: Double = 1.0
+    @State private var wasInPeakZone = false
+    
+    private var color: Color {
+        switch distance {
+        case 0..<15:    return .green
+        case 15..<50:   return Color(red: 0.4, green: 0.8, blue: 0.2)
+        case 50..<100:  return .yellow
+        case 100..<200: return .orange
+        default:        return .red
+        }
+    }
+    
+    private var radarSpeed: Double {
+        switch distance {
+        case 0..<15:   return 0.8
+        case 15..<50:  return 1.2
+        case 50..<100: return 1.6
+        default:       return 2.2
+        }
+    }
+    
+    private var dynamicColor: Color {
+        let normalizedAngle = {
+            var angle = rotationAngle
+            while angle > 180  { angle -= 360 }
+            while angle < -180 { angle += 360 }
+            return angle
+        }()
+
+        let absAngle = abs(normalizedAngle)
+        let alignment = max(0, (180 - absAngle) / 180)
+        
+        return color.opacity(0.6 + (alignment * 0.8))
+    }
+    
+    private var brightnessAmount: Double {
+        let normalizedAngle = {
+            var angle = rotationAngle
+            while angle > 180  { angle -= 360 }
+            while angle < -180 { angle += 360 }
+            return angle
+        }()
+
+        let absAngle = abs(normalizedAngle)
+        let alignment = max(0, (180 - absAngle) / 180)
+        
+        return alignment * 0.1
+    }
+    
+    var body: some View {
+        ZStack {
+            PulseRing(color: color, pulseSpeed: radarSpeed)
+            
+            // Main circle
+            Circle()
+                .fill(color.opacity(0.15))
+                .frame(width: 120, height: 120)
+            
+            Circle()
+                .stroke(color, lineWidth: 2)
+                .frame(width: 120, height: 120)
+            
+            // Arrow
+            Image(systemName: "arrow.up")
+                .font(.system(size: 40, weight: .semibold))
+                .foregroundStyle(dynamicColor)
+                .brightness(brightnessAmount)
+                .rotationEffect(.degrees(smoothedAngle))
+                .scaleEffect(arrowScale)
+                .animation(.easeInOut(duration: 0.3), value: smoothedAngle)
+        }
+        .onChange(of: rotationAngle) { _, newAngle in
+            var delta = newAngle - smoothedAngle
+            while delta > 180  { delta -= 360 }
+            while delta < -180 { delta += 360 }
+            smoothedAngle += delta
+            
+            let absAngle = min(abs(newAngle), 180)
+            let alignment = max(0, (180 - absAngle) / 180)
+            
+            let targetScale = 1.0 + (alignment * 0.15)
+            
+            withAnimation(.easeOut(duration: 0.2)) {
+                arrowScale = targetScale
+            }
+        }
+    }
+}
+
+// MARK: - Pulse Ring
+struct PulseRing: View {
+    let color: Color
+    let pulseSpeed: Double
+    
+    @State private var animate = false
+    
+    var body: some View {
+        Circle()
+            .stroke(color.opacity(animate ? 0 : 0.45), lineWidth: 1.5)
+            .frame(width: animate ? 230 : 120, height: animate ? 230 : 120)
+            .animation(
+                .linear(duration: pulseSpeed)
+                .repeatForever(autoreverses: false),
+                value: animate
+            )
+            .onAppear { animate = true }
+    }
+}
+
+// MARK: - Breadcrumb Map
+struct BreadcrumbMapView: UIViewRepresentable {
+    let memory: MemoryNode
+    let currentLocation: CLLocation
+    
+    func makeUIView(context: Context) -> MKMapView {
+        let mapView = MKMapView()
+        mapView.delegate = context.coordinator
+        mapView.showsUserLocation = true
+        mapView.userTrackingMode = .followWithHeading
+        mapView.layer.cornerRadius = 16
+        mapView.layer.masksToBounds = true
+        
+        mapView.layer.borderWidth = 1
+        mapView.layer.borderColor = UIColor.white.withAlphaComponent(0.2).cgColor
+        
+        return mapView
+    }
+    
+    func updateUIView(_ mapView: MKMapView, context: Context) {
+        mapView.removeOverlays(mapView.overlays)
+        mapView.removeAnnotations(mapView.annotations.filter { !($0 is MKUserLocation) })
+        
+        let capturePin = MKPointAnnotation()
+        capturePin.coordinate = CLLocationCoordinate2D(
+            latitude: memory.latitude,
+            longitude: memory.longitude
+        )
+        capturePin.title = "Captured here"
+        mapView.addAnnotation(capturePin)
+        
+        var coords: [CLLocationCoordinate2D] = []
+        coords.append(CLLocationCoordinate2D(latitude: memory.latitude, longitude: memory.longitude))
+        for crumb in memory.breadcrumbs {
+            coords.append(CLLocationCoordinate2D(latitude: crumb.latitude, longitude: crumb.longitude))
+        }
+        
+        if coords.count > 1 {
+            let polyline = MKPolyline(coordinates: &coords, count: coords.count)
+            mapView.addOverlay(polyline)
+        }
+        
+        // Only set region once on first load
+        if !context.coordinator.hasSetRegion {
+            context.coordinator.hasSetRegion = true
+            var allCoords = coords
+            allCoords.append(currentLocation.coordinate)
+            let region = regionForCoordinates(allCoords)
+            mapView.setRegion(region, animated: false)
+        }
+    }
+    
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    
+    class Coordinator: NSObject, MKMapViewDelegate {
+        var hasSetRegion = false
+        
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            if let polyline = overlay as? MKPolyline {
+                let renderer = MKPolylineRenderer(polyline: polyline)
+                renderer.strokeColor = UIColor.systemBlue.withAlphaComponent(0.7)
+                renderer.lineWidth = 3
+                renderer.lineDashPattern = [6, 4]
+                return renderer
+            }
+            return MKOverlayRenderer(overlay: overlay)
+        }
+        
+        func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
+            guard !(annotation is MKUserLocation) else { return nil }
+            let view = MKMarkerAnnotationView(annotation: annotation, reuseIdentifier: "capture")
+            view.markerTintColor = .systemGreen
+            view.glyphImage = UIImage(systemName: "camera.fill")
+            return view
+        }
+    }
+    
+    private func regionForCoordinates(_ coordinates: [CLLocationCoordinate2D]) -> MKCoordinateRegion {
+        guard !coordinates.isEmpty else {
+            return MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: memory.latitude, longitude: memory.longitude),
+                span: MKCoordinateSpan(latitudeDelta: 0.008, longitudeDelta: 0.008)
+            )
+        }
+        let minLat = coordinates.map(\.latitude).min()!
+        let maxLat = coordinates.map(\.latitude).max()!
+        let minLon = coordinates.map(\.longitude).min()!
+        let maxLon = coordinates.map(\.longitude).max()!
+        let center = CLLocationCoordinate2D(
+            latitude: (minLat + maxLat) / 2,
+            longitude: (minLon + maxLon) / 2
+        )
+        let span = MKCoordinateSpan(
+            latitudeDelta: max((maxLat - minLat) * 1.6, 0.008),
+            longitudeDelta: max((maxLon - minLon) * 1.6, 0.008)
+        )
+        return MKCoordinateRegion(center: center, span: span)
+    }
+}
+// MARK: - Haptic Direction Manager
+class HapticDirectionManager {
+    static let shared = HapticDirectionManager()
+    
+    private let light = UIImpactFeedbackGenerator(style: .light)
+    private let medium = UIImpactFeedbackGenerator(style: .medium)
+    private let heavy = UIImpactFeedbackGenerator(style: .heavy)
+    private let notification = UINotificationFeedbackGenerator()
+    private var lastHapticTime: Date = .distantPast
+    private var wasInPeakZone = false
+    private var wasInRange = false
+    
+    private let maxDistance: Double = 100
+    private let angleRange: Double = 120
+    private let peakAngle: Double = 10
+    
+    init() {
+        light.prepare()
+        medium.prepare()
+        heavy.prepare()
+        notification.prepare()
+    }
+    
+    func update(angleDiff: Double, distance: Double) {
+        guard distance <= maxDistance else {
+            wasInRange = false
+            wasInPeakZone = false
+            return
+        }
+        
+        let absAngle = min(abs(angleDiff), 180)
+        guard absAngle < angleRange else {
+            wasInRange = false
+            wasInPeakZone = false
+            return
+        }
+        
+        wasInRange = true
+        let inPeakZone = absAngle <= peakAngle
+        
+        if inPeakZone && !wasInPeakZone {
+            wasInPeakZone = true
+            notification.notificationOccurred(.success)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.heavy.impactOccurred(intensity: 1.0) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3)  { self.heavy.impactOccurred(intensity: 0.8) }
+            lastHapticTime = Date()
+            return
+        }
+        
+        if !inPeakZone { wasInPeakZone = false }
+        
+        let interval = pulseInterval(angleDiff: angleDiff)
+        let now = Date()
+        guard now.timeIntervalSince(lastHapticTime) >= interval else { return }
+        lastHapticTime = now
+        
+        let a = alignment(for: absAngle)
+        let intensity = CGFloat(0.35 + (a * 0.65))
+        
+        if absAngle < 30      { heavy.impactOccurred(intensity: intensity) }
+        else if absAngle < 60 { medium.impactOccurred(intensity: intensity) }
+        else                  { light.impactOccurred(intensity: intensity * 0.7) }
+    }
+    
+    func alignment(for absAngle: Double) -> Double {
+        (angleRange - min(absAngle, angleRange)) / angleRange
+    }
+    
+    func pulseInterval(angleDiff: Double) -> Double {
+        let absAngle = min(abs(angleDiff), 180)
+        guard absAngle < angleRange else { return 2.5 }
+        let a = alignment(for: absAngle)
+        return 2.5 - ((a * a) * 2.35)
+    }
+    
+    func stop() {
+        wasInRange = false
+        wasInPeakZone = false
+    }
+}
