@@ -247,12 +247,6 @@ struct FindItView: View {
                     Text("GPS \(navigationStateManager.currentMode == .gpsReliable ? "High" : navigationStateManager.currentMode == .gpsDegrading ? "Medium" : "Low") • \(Int(confidenceManager.confidenceScore * 100))%")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.white.opacity(0.62))
-                    if memory.hasRefinedLocation {
-                        Text("Location refined")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.mint.opacity(0.95))
-                            .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                    }
                     Text(proximityLabel(distance: distance))
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(.white.opacity(0.7))
@@ -747,7 +741,7 @@ struct BreadcrumbMapView: UIViewRepresentable {
         
         let capturePin = MKPointAnnotation()
         capturePin.coordinate = targetCoordinate
-        capturePin.title = memory.hasRefinedLocation ? "Refined capture location" : "Captured here"
+        capturePin.title = "Captured here"
         mapView.addAnnotation(capturePin)
         
         let trailSegments = trailCoordinateSegments()

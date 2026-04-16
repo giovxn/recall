@@ -11,6 +11,8 @@ struct MemoryAnalysis {
 
 class VisionAnalyzer {
     static let shared = VisionAnalyzer()
+    private let ocrMinConfidence: Float = 0.55
+    private let ocrFallbackConfidence: Float = 0.28
     
     func analyze(imageData: Data, completion: @escaping (MemoryAnalysis) -> Void) {
         guard let uiImage = UIImage(data: imageData),
@@ -28,23 +30,25 @@ class VisionAnalyzer {
             defer { group.leave() }
             guard let observations = request.results as? [VNRecognizedTextObservation] else { return }
             for observation in observations {
-                guard let candidate = observation.topCandidates(1).first else { continue }
-                let text = candidate.string
+                guard let candidate = self.bestTextCandidate(from: observation) else { continue }
+                let text = Self.normalizeOCRText(candidate.string)
+                guard !text.isEmpty else { continue }
                 let size = observation.boundingBox.height
                 detectedText.append(text)
                 textWithSizes.append((text: text, size: size))
             }
             textWithSizes.sort { $0.size > $1.size }
+            detectedText = Self.deduplicatedText(detectedText)
         }
         textRequest.recognitionLevel = .accurate
-        textRequest.usesLanguageCorrection = false
+        textRequest.usesLanguageCorrection = true
         textRequest.minimumTextHeight = 0.02
         
         group.enter()
         let classifyRequest = VNClassifyImageRequest { request, _ in
             defer { group.leave() }
             guard let observations = request.results as? [VNClassificationObservation] else { return }
-            let top = observations.filter { $0.confidence > 0.3 }.prefix(3)
+            let top = observations.filter { $0.confidence > 0.2 }.prefix(3)
             classification = Self.mapClassification(top.map { $0.identifier })
         }
         
@@ -57,6 +61,12 @@ class VisionAnalyzer {
                 detectedText: detectedText,
                 textWithSizes: textWithSizes
             )
+            let inferredFromLabel = Self.inferClassification(fromSmartLabel: smartLabel)
+            if inferredFromLabel != "memory" {
+                classification = inferredFromLabel
+            } else if let inferredFromText = Self.inferClassification(fromText: detectedText) {
+                classification = inferredFromText
+            }
             let analysis = MemoryAnalysis(
                 classification: classification,
                 smartLabel: smartLabel,
@@ -79,10 +89,10 @@ class VisionAnalyzer {
             return contextLabel
         }
         
-        let usefulText = detectedText.filter {
-            let t = $0.trimmingCharacters(in: .whitespaces)
-            return t.count >= 1 && t.count <= 20
-        }.prefix(2)
+        let usefulText = prioritizedContextText(
+            from: textWithSizes,
+            classification: classification
+        )
         
         switch classification {
         case "parking":
@@ -106,119 +116,109 @@ class VisionAnalyzer {
     
     // MARK: - Unified Text Context (parking vs plate decision tree)
     private static func extractTextContext(from textWithSizes: [(text: String, size: CGFloat)]) -> String? {
-        let emirates = ["Dubai", "Abu Dhabi", "Sharjah", "Ajman", "RAK", "Fujairah", "UAQ",
-                        "دبي", "أبوظبي", "الشارقة", "عجمان", "رأس الخيمة", "الفجيرة"]
-        let parkingPrefixes = ["P", "G", "B", "L"]
-        let parkingKeywords = ["level", "floor", "zone", "basement", "ground", "parking", "park"]
-        
-        var emirateName: String? = nil
-        var hasParkingKeyword = false
-        var parkingPrefixText: String? = nil
-        var letterCodes: [(code: String, size: CGFloat)] = []
-        var numbers: [(number: String, size: CGFloat)] = []
-        
-        for item in textWithSizes {
-            let trimmed = item.text.trimmingCharacters(in: .whitespaces)
-            let lower = trimmed.lowercased()
-            
-            // Emirate detection
-            for emirate in emirates {
-                if trimmed.localizedCaseInsensitiveContains(emirate) {
-                    emirateName = emirate
-                }
+        let normalizedItems = textWithSizes
+            .map { (text: normalizeOCRText($0.text), size: $0.size) }
+            .filter { !$0.text.isEmpty }
+        guard !normalizedItems.isEmpty else { return nil }
+
+        let parkingStopWords = Set(["ROW", "CENTRAL", "GALLERIA", "STREET", "ROAD", "EXIT", "ENTRANCE", "IKEA"])
+        let parkingKeywords = ["LEVEL", "FLOOR", "ZONE", "BASEMENT", "GROUND", "PARKING", "PARK"]
+        let emirates = [
+            "DUBAI", "ABU DHABI", "SHARJAH", "AJMAN", "RAK", "FUJAIRAH", "UAQ",
+            "دبي", "أبوظبي", "الشارقة", "عجمان", "رأس الخيمة", "الفجيرة"
+        ]
+
+        func regexMatch(_ text: String, _ pattern: String) -> Bool {
+            text.range(of: pattern, options: .regularExpression) != nil
+        }
+
+        // 1) Parking-first candidates (highest priority)
+        var parkingCandidates: [(value: String, score: Double)] = []
+        for item in normalizedItems {
+            let text = item.text
+            if parkingStopWords.contains(text) { continue }
+            var score = Double(item.size) * 100
+
+            if regexMatch(text, "^[PGBL][0-9]{1,3}\\s?[A-Z]{1,2}$") {
+                // Examples: P3C, P3 C, B01, G8 A
+                score += 60
+                let compact = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                parkingCandidates.append((value: compact, score: score))
+                continue
             }
-            
-            // Parking keyword detection
-            for keyword in parkingKeywords {
-                if lower.contains(keyword) {
-                    hasParkingKeyword = true
-                }
+            if regexMatch(text, "^[PGBL][0-9]{1,3}$") {
+                // Examples: P1, B01, G8
+                score += 42
+                parkingCandidates.append((value: text, score: score))
+                continue
             }
-            
-            // Combined parking format e.g. "P5AA", "P5 AA", "G3BB"
-            if trimmed.range(of: "^[PGBL][0-9]{1,3}\\s?[A-Z]{1,2}$", options: .regularExpression) != nil {
-                return "Parking · \(trimmed)"
+            if regexMatch(text, "^[A-Z][0-9]{1,3}$") || regexMatch(text, "^[0-9]{1,3}[A-Z]$") {
+                // Examples: C8, 8C
+                score += 34
+                parkingCandidates.append((value: text, score: score))
+                continue
             }
-            
-            // Parking prefix format e.g. "P5", "G3", "B2"
-            for prefix in parkingPrefixes {
-                if trimmed.range(of: "^\(prefix)[0-9]{1,3}$", options: .regularExpression) != nil {
-                    parkingPrefixText = trimmed
-                }
-            }
-            
-            // Letter codes (1-3 uppercase letters only)
-            if trimmed.range(of: "^[A-Z]{1,3}$", options: .regularExpression) != nil {
-                letterCodes.append((code: trimmed, size: item.size))
-            }
-            
-            // Numbers (1-6 digits)
-            if trimmed.range(of: "^[0-9]{1,6}$", options: .regularExpression) != nil {
-                numbers.append((number: trimmed, size: item.size))
+            if regexMatch(text, "^(LEVEL|L)\\s?[0-9]{1,2}$") {
+                // Examples: LEVEL1, L1
+                score += 26
+                parkingCandidates.append((value: text.replacingOccurrences(of: "LEVEL", with: "L"), score: score))
             }
         }
-        
-        // Sort by size descending (largest = closest/most prominent)
-        numbers.sort { $0.size > $1.size }
-        letterCodes.sort { $0.size > $1.size }
-        
-        // RULE 1 — explicit parking keyword → parking
-        if hasParkingKeyword {
-            let keywordText = textWithSizes.first(where: { item in
-                parkingKeywords.contains(where: { item.text.lowercased().contains($0) })
-            })?.text.trimmingCharacters(in: .whitespaces) ?? ""
+
+        if !parkingCandidates.isEmpty {
+            let sorted = parkingCandidates.sorted { $0.score > $1.score }
+            let primary = sorted[0].value
+            if let secondary = sorted.dropFirst().first(where: { $0.value != primary })?.value,
+               secondary.count <= 4,
+               regexMatch(secondary, "^([A-Z]{1,2}|[0-9]{1,3}[A-Z]?)$") {
+                return "Parking · \(primary) \(secondary)"
+            }
+            return "Parking · \(primary)"
+        }
+
+        // 2) Explicit parking keywords fallback
+        if let keywordText = normalizedItems.first(where: { item in
+            parkingKeywords.contains(where: { item.text.contains($0) })
+        })?.text {
             return "Parking · \(keywordText)"
         }
-        
-        // RULE 2 — parking prefix present (P5, G3 etc)
-        if let prefix = parkingPrefixText {
-            // Check for adjacent letter code (P5 + AA = P5 AA)
-            if let letters = letterCodes.first {
-                return "Parking · \(prefix) \(letters.code)"
-            }
-            return "Parking · \(prefix)"
-        }
-        
-        guard let bestNumber = numbers.first else { return nil }
-        let digits = bestNumber.number.count
-        
-        // RULE 3 — emirate name present → definitely a plate
-        if let emirate = emirateName {
-            let bestLetters = letterCodes.min(by: {
-                abs($0.size - bestNumber.size) < abs($1.size - bestNumber.size)
-            })
-            var parts = [emirate]
-            if let letters = bestLetters { parts.append(letters.code) }
-            parts.append(bestNumber.number)
+
+        // 3) Plate-like fallback
+        let letterCodes = normalizedItems
+            .filter { regexMatch($0.text, "^[A-Z]{1,3}$") }
+            .sorted { $0.size > $1.size }
+        let numbers = normalizedItems
+            .filter { regexMatch($0.text, "^[0-9]{1,6}$") }
+            .sorted { $0.size > $1.size }
+
+        guard let bestNumber = numbers.first?.text else { return nil }
+        let digits = bestNumber.count
+        let emirateName = normalizedItems.first(where: { item in
+            emirates.contains(where: { item.text.localizedCaseInsensitiveContains($0) })
+        })?.text
+
+        if let emirateName {
+            let bestLetters = letterCodes.first?.text
+            var parts = [emirateName]
+            if let bestLetters { parts.append(bestLetters) }
+            parts.append(bestNumber)
             return parts.joined(separator: " · ")
         }
-        
-        // RULE 4 — 4-5 digits + letters → plate
-        if digits >= 4, let bestLetters = letterCodes.first {
-            return "\(bestLetters.code) · \(bestNumber.number)"
+
+        if digits >= 4, let bestLetters = letterCodes.first?.text {
+            return "\(bestLetters) · \(bestNumber)"
         }
-        
-        // RULE 5 — 1-3 digits + letters → parking
-        if digits <= 3, let bestLetters = letterCodes.first {
-            return "Parking · \(bestLetters.code) \(bestNumber.number)"
+        if digits <= 3, let bestLetters = letterCodes.first?.text {
+            return "Parking · \(bestLetters) \(bestNumber)"
         }
-        
-        // RULE 6 — 4+ digits alone → likely plate
-        if digits >= 4 {
-            return "\(bestNumber.number)"
-        }
-        
-        // RULE 7 — 1-3 digits alone → parking
-        if digits <= 3 {
-            return "Parking · \(bestNumber.number)"
-        }
-        
+        if digits >= 4 { return bestNumber }
+        if digits <= 3 { return "Parking · \(bestNumber)" }
         return nil
     }
     
     // MARK: - Classification mapping
     private static func mapClassification(_ identifiers: [String]) -> String {
-        let joined = identifiers.joined(separator: " ")
+        let joined = identifiers.joined(separator: " ").lowercased()
         if joined.contains("car") || joined.contains("vehicle") || joined.contains("automobile") { return "parking" }
         if joined.contains("baggage") || joined.contains("luggage") || joined.contains("suitcase") { return "luggage" }
         if joined.contains("food") || joined.contains("dish") || joined.contains("meal") { return "food" }
@@ -227,6 +227,111 @@ class VisionAnalyzer {
         if joined.contains("person") || joined.contains("face") { return "person" }
         if joined.contains("building") || joined.contains("architecture") { return "place" }
         return "memory"
+    }
+    
+    private static func inferClassification(fromSmartLabel smartLabel: String) -> String {
+        let lower = smartLabel.lowercased()
+        if lower.contains("parking") { return "parking" }
+        if lower.contains("luggage") { return "luggage" }
+        if lower.contains("food") { return "food" }
+        if lower.contains("shop") { return "shop" }
+        if lower.contains("note") || lower.contains("document") { return "document" }
+        if lower.contains("person") { return "person" }
+        if lower.contains("place") { return "place" }
+        return "memory"
+    }
+    
+    private static func inferClassification(fromText detectedText: [String]) -> String? {
+        let joined = detectedText.joined(separator: " ").lowercased()
+        let parkingTokens = ["parking", "level", "basement", "zone", "floor", "p", "g", "b"]
+        if parkingTokens.contains(where: { joined.contains($0) }) {
+            return "parking"
+        }
+        return nil
+    }
+    
+    private func bestTextCandidate(from observation: VNRecognizedTextObservation) -> VNRecognizedText? {
+        let candidates = observation.topCandidates(3)
+        if let strong = candidates.first(where: { $0.confidence >= ocrMinConfidence }) {
+            return strong
+        }
+        if let fallback = candidates.first(where: { $0.confidence >= ocrFallbackConfidence }) {
+            return fallback
+        }
+        guard let top = candidates.first else { return nil }
+        // Keep a final fallback for short parking/plate-like tokens.
+        let normalized = Self.normalizeOCRText(top.string)
+        let hasParkingLikeToken = normalized.range(of: "^[PGBL][0-9]{1,3}(\\s?[A-Z]{1,2})?$", options: .regularExpression) != nil
+            || normalized.range(of: "^[A-Z]{1,3}[0-9]{1,4}$", options: .regularExpression) != nil
+        return hasParkingLikeToken ? top : nil
+    }
+    
+    private static func normalizeOCRText(_ raw: String) -> String {
+        var normalized = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        normalized = normalized.replacingOccurrences(of: "[^A-Z0-9\\s\\-]", with: "", options: .regularExpression)
+        normalized = normalized.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        normalized = normalized.replacingOccurrences(of: "\\s*\\-\\s*", with: "-", options: .regularExpression)
+        normalized = normalized.trimmingCharacters(in: .whitespaces)
+        return normalized
+    }
+    
+    private static func deduplicatedText(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for value in values {
+            if seen.insert(value).inserted {
+                result.append(value)
+            }
+        }
+        return result
+    }
+    
+    private static func prioritizedContextText(
+        from textWithSizes: [(text: String, size: CGFloat)],
+        classification: String
+    ) -> [String] {
+        let stopPhrases = Set([
+            "EXIT", "ENTRANCE", "PARKING", "LEVEL", "FLOOR", "STREET", "ROAD",
+            "NO PARKING", "WAY OUT", "LIFT", "STAIRS"
+        ])
+        
+        let ranked = textWithSizes.compactMap { item -> (text: String, score: Double)? in
+            let text = item.text.trimmingCharacters(in: .whitespaces)
+            guard text.count >= 2, text.count <= 22 else { return nil }
+            if stopPhrases.contains(text) { return nil }
+            
+            let hasDigits = text.rangeOfCharacter(from: .decimalDigits) != nil
+            let hasLetters = text.rangeOfCharacter(from: .letters) != nil
+            var score = Double(item.size) * 100
+            
+            if hasDigits && hasLetters { score += 24 }
+            if hasDigits && !hasLetters { score += 8 }
+            if text.count <= 10 { score += 6 }
+            if text.contains("-") { score += 4 }
+            
+            // Parking/document contexts benefit from compact, code-like tokens.
+            if classification == "parking" || classification == "document" {
+                if text.range(of: "^[A-Z]{1,3}[0-9]{1,4}$", options: .regularExpression) != nil {
+                    score += 20
+                }
+                if text.range(of: "^[A-Z]{1,3}\\s?[0-9]{1,4}$", options: .regularExpression) != nil {
+                    score += 12
+                }
+                if text.range(of: "^[PGBL][0-9]{1,3}\\s?[A-Z]{1,2}$", options: .regularExpression) != nil {
+                    score += 30
+                }
+                if text.range(of: "^[PGBL][0-9]{1,3}$", options: .regularExpression) != nil {
+                    score += 18
+                }
+            }
+            
+            return (text, score)
+        }
+        .sorted { $0.score > $1.score }
+        
+        return deduplicatedText(ranked.map(\.text)).prefix(2).map { $0 }
     }
     
     // MARK: - Dominant color
