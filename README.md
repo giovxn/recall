@@ -2,6 +2,8 @@
 
 Recall is an iOS app that helps you save a memory (photo + location) and find your way back to it later.
 
+![Recall preview](Recall/docs/recall-preview.png)
+
 ## What it does
 
 - Capture a memory with camera and GPS.
@@ -24,7 +26,7 @@ Recall is an iOS app that helps you save a memory (photo + location) and find yo
 
 High-level architecture diagram:
 
-![Recall low-level architecture](Recall/docs/recall-high-level.png)
+![Recall high-level architecture](Recall/docs/recall-high-level.png)
 
 Low-level architecture diagram:
 
