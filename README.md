@@ -30,13 +30,7 @@ High-level architecture diagram:
 
 Low-level architecture diagram:
 
-<<<<<<< HEAD
-![Recall low-level architecture](Recall/docs/recall-low-level.png)
-=======
 <img src="Recall/docs/recall-low-level.png" alt="Recall low-level architecture" width="700" />
-
-> Add `recall-low-level.png` to `docs/` (path: `docs/recall-low-level.png`).
->>>>>>> b7f8a58 (create README file and added low-level architecture)
 
 ## Project structure
 
