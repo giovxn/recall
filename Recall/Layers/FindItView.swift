@@ -264,12 +264,6 @@ struct FindItView: View {
                 }
                 .allowsHitTesting(true)
             }
-            .onChange(of: distanceStr) {
-                LiveActivityManager.shared.updateActivity(
-                    arrow: DirectionHelper.relativeArrow(bearing: bearing, currentHeading: heading),
-                    distance: distanceStr
-                )
-            }
         } else {
             VStack(spacing: 12) {
                 ProgressView().tint(.white)
@@ -452,6 +446,7 @@ struct FindItView: View {
     private func handleAppear() {
         locationManager.requestPermission()
         locationManager.startUpdating()
+        NavigationLiveActivityUpdater.shared.start(memory: memory)
         lastNavigationMode = navigationStateManager.currentMode
     }
     
@@ -477,7 +472,12 @@ struct FindItView: View {
     }
     
     private func handleDisappear() {
-        locationManager.stopUpdating()
+        // Locking the phone can trigger view transitions; keep tracking alive outside foreground.
+        let appState = UIApplication.shared.applicationState
+        if appState == .active {
+            locationManager.stopUpdating()
+            NavigationLiveActivityUpdater.shared.stop()
+        }
         directionalGuidanceManager.deactivate()
         HapticDirectionManager.shared.stop()
     }
@@ -540,6 +540,29 @@ struct FindItView: View {
         case .gpsUnreliable:
             return "Weak Signal, Guiding by Direction"
         }
+    }
+
+    private func gpsLevelText(for mode: NavigationMode) -> String {
+        switch mode {
+        case .gpsReliable: return "High"
+        case .gpsDegrading: return "Medium"
+        case .gpsUnreliable: return "Low"
+        }
+    }
+
+    private func normalizedAngle(_ angle: Double) -> Double {
+        var normalized = angle
+        while normalized > 180 { normalized -= 360 }
+        while normalized < -180 { normalized += 360 }
+        return normalized
+    }
+
+    private func liveDirectionText(for angle: Double) -> String {
+        let absAngle = abs(angle)
+        if absAngle <= 12 { return "Forward" }
+        if absAngle <= 30 { return angle > 0 ? "Slight right" : "Slight left" }
+        if absAngle <= 75 { return angle > 0 ? "Turn right" : "Turn left" }
+        return "Turn around"
     }
     
     private func showToast(_ text: String) {

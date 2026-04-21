@@ -102,7 +102,7 @@ struct CaptureView: View {
             }
             
             BreadcrumbManager.shared.start(for: memory, context: modelContext)
-            LiveActivityManager.shared.startActivity(memory: memory, arrow: "↑", distance: "Calculating...")
+            LiveActivityManager.shared.startActivity(memory: memory)
             refinePendingLocation(for: memory, initialLocation: location)
             
             withAnimation {

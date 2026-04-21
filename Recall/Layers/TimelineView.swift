@@ -164,7 +164,9 @@ struct TimelineView: View {
     
     private func deleteMemories(at offsets: IndexSet) {
         for index in offsets {
-            modelContext.delete(memories[index])
+            let memory = memories[index]
+            LiveActivityManager.shared.endActivity(for: memory.id)
+            modelContext.delete(memory)
         }
     }
 
