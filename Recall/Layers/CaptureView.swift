@@ -54,7 +54,7 @@ struct CaptureView: View {
                             RoundedRectangle(cornerRadius: 36, style: .continuous)
                                 .stroke(.white.opacity(0.22), lineWidth: 1)
                         }
-                        .shadow(color: .black.opacity(0.26), radius: 18, y: 6)
+                        .shadow(color: .black.opacity(0.67), radius: 18, y: 6)
                         .frame(height: 80)
                         .padding(.horizontal, 68)
 
@@ -62,10 +62,9 @@ struct CaptureView: View {
                         Button {
                         } label: {
                             Image(systemName: camera.isTorchOn ? "bolt.fill" : "bolt.slash.fill")
-                                .font(.system(size: 14, weight: .semibold))
+                                .font(.system(size: 16, weight: .semibold))
                                 .foregroundStyle(camera.isTorchOn ? .yellow : .white)
                                 .frame(width: 30, height: 30)
-                                .background(.black.opacity(0.35), in: Circle())
                         }
                         .disabled(!camera.supportsFlash)
                         .simultaneousGesture(
@@ -82,10 +81,9 @@ struct CaptureView: View {
                             camera.toggleWideZoom()
                         } label: {
                             Image(systemName: camera.isWideZoomMode ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                                .font(.system(size: 14, weight: .semibold))
+                                .font(.system(size: 16, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .frame(width: 30, height: 30)
-                                .background(.black.opacity(0.35), in: Circle())
                         }
                     }
                     .padding(.horizontal, 90)
