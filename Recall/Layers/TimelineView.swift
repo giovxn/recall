@@ -18,6 +18,7 @@ struct TimelineView: View {
     @Query(sort: \MemoryNode.timestamp, order: .reverse) private var memories: [MemoryNode]
     @StateObject private var locationManager = LocationManager()
     @State private var showManualMemorySheet = false
+    @State private var editingMemory: MemoryNode?
 #if DEBUG
     @State private var isRunningSimulation = false
     @State private var simulationStatus: String?
@@ -42,6 +43,21 @@ struct TimelineView: View {
                         ForEach(memories) { memory in
                             NavigationLink(destination: FindItView(memory: memory)) {
                                 MemoryRow(memory: memory)
+                            }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button(role: .destructive) {
+                                    LiveActivityManager.shared.endActivity(for: memory.id)
+                                    modelContext.delete(memory)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                .tint(.red)
+                                Button {
+                                    editingMemory = memory
+                                } label: {
+                                    Label("Edit", systemImage: "pencil")
+                                }
+                                .tint(.blue)
                             }
                         }
                         .onDelete(perform: deleteMemories)
@@ -76,6 +92,28 @@ struct TimelineView: View {
                             runDebugSimulation(.poor)
                         }
                         .disabled(isRunningSimulation)
+                        Divider()
+                        Button("Run curved-path simulation (mixed GPS)") {
+                            runDebugSimulation(.mixed, route: .curvedPark)
+                        }
+                        .disabled(isRunningSimulation)
+                        Button("Run out-and-back simulation (mixed GPS)") {
+                            runDebugSimulation(.mixed, route: .outAndBack)
+                        }
+                        .disabled(isRunningSimulation)
+                        Divider()
+                        Button("Benchmark: underground parking (good vs mixed)") {
+                            runOverlayComparisonSimulation(.parkingExitSimple)
+                        }
+                        .disabled(isRunningSimulation)
+                        Button("Benchmark: urban canyon (good vs mixed)") {
+                            runOverlayComparisonSimulation(.parkingToMallSimple)
+                        }
+                        .disabled(isRunningSimulation)
+                        Button("Benchmark: complex long route (good vs mixed)") {
+                            runOverlayComparisonSimulation(.complexLong)
+                        }
+                        .disabled(isRunningSimulation)
                     } label: {
                         if isRunningSimulation {
                             Label("Running", systemImage: "dot.radiowaves.left.and.right")
@@ -90,6 +128,9 @@ struct TimelineView: View {
         }
         .sheet(isPresented: $showManualMemorySheet) {
             ManualMemorySheet(modelContext: modelContext)
+        }
+        .sheet(item: $editingMemory) { memory in
+            EditMemorySheet(memory: memory, modelContext: modelContext)
         }
         .onAppear {
             locationManager.requestPermission()
@@ -193,20 +234,95 @@ struct TimelineView: View {
         }
     }
 
-    private func runDebugSimulation(_ profile: SimulationProfile) {
+    private enum SimulationRoute {
+        case cityBlocks
+        case curvedPark
+        case outAndBack
+
+        var label: String {
+            switch self {
+            case .cityBlocks: return "city blocks"
+            case .curvedPark: return "curved park path"
+            case .outAndBack: return "out and back"
+            }
+        }
+    }
+
+    private enum OverlayRoute {
+        case parkingExitSimple
+        case parkingToMallSimple
+        case complexLong
+
+        var label: String {
+            switch self {
+            case .parkingExitSimple: return "parking exit simple"
+            case .parkingToMallSimple: return "parking to mall simple"
+            case .complexLong: return "complex long route"
+            }
+        }
+
+        var stepDistance: Double {
+            switch self {
+            case .parkingExitSimple: return 4.4
+            case .parkingToMallSimple: return 4.6
+            case .complexLong: return 4.8
+            }
+        }
+
+        var routeHeadings: [Double] {
+            switch self {
+            case .parkingExitSimple:
+                // Straight aisle -> left turn -> straight -> right turn -> mall entry.
+                return [0, 0, 0, 90, 90, 90, 0, 0, 270, 270, 270, 0, 0]
+            case .parkingToMallSimple:
+                // Ramp out + two easy turns, realistic for parking-to-entrance flow.
+                return [0, 10, 18, 25, 32, 40, 60, 80, 90, 90, 90, 45, 20, 0, 0, 0]
+            case .complexLong:
+                // Long route with mixed straights, bends and block-like turns.
+                return [
+                    0, 0, 0, 15, 25, 35, 45, 55, 65, 75, 85, 90, 90, 90,
+                    70, 50, 30, 10, 0, 0, 340, 320, 300, 280, 270, 270,
+                    285, 300, 320, 340, 0, 20, 40, 60, 80, 100, 120, 140,
+                    160, 180, 180, 165, 150, 135, 120, 105, 90, 90, 90, 70,
+                    50, 30, 15, 0, 0, 350, 340, 330, 320, 300
+                ]
+            }
+        }
+
+        var dropoutSteps: Set<Int> {
+            switch self {
+            case .parkingExitSimple:
+                return [4, 5, 9]
+            case .parkingToMallSimple:
+                return [6, 7, 11]
+            case .complexLong:
+                return [8, 9, 16, 17, 24, 25, 37, 38, 49, 50]
+            }
+        }
+
+        var headingOffsets: [Double] {
+            switch self {
+            case .parkingExitSimple: return [-6, -3, 0, 2, 4]
+            case .parkingToMallSimple: return [-5, -2, 0, 2, 4]
+            case .complexLong: return [-7, -4, -1, 0, 2, 5]
+            }
+        }
+    }
+
+    private func runDebugSimulation(_ profile: SimulationProfile, route: SimulationRoute = .cityBlocks) {
         guard !isRunningSimulation else { return }
         guard let start = locationManager.currentLocation else {
             simulationStatus = "Simulation failed: no current location"
             return
         }
         isRunningSimulation = true
-        simulationStatus = "Running turn-route simulation (\(profile.label))..."
+        simulationStatus = "Running \(route.label) simulation (\(profile.label))..."
 
         let memory = makeSimulationMemory(from: start, profile: profile)
         modelContext.insert(memory)
         try? modelContext.save()
-        let headings = simulationRouteHeadings()
-        let stepDistance = 4.5
+        let headings = simulationRouteHeadings(route: route)
+        let stepDistance = simulationStepDistance(for: route)
         let startTime = Date()
         BreadcrumbManager.shared.start(for: memory, context: modelContext)
         runSimulationStep(
@@ -218,6 +334,138 @@ struct TimelineView: View {
             stepDistance: stepDistance,
             startTime: startTime
         )
+    }
+
+    private func runOverlayComparisonSimulation(_ route: OverlayRoute) {
+        guard !isRunningSimulation else { return }
+        guard let start = locationManager.currentLocation else {
+            simulationStatus = "Overlay simulation failed: no current location"
+            return
+        }
+        isRunningSimulation = true
+        simulationStatus = "Running overlay simulation (\(route.label))..."
+
+        let memory = makeSimulationMemory(from: start, profile: .mixed)
+        memory.smartLabel = "Overlay benchmark - \(route.label)"
+        memory.classification = "place"
+        modelContext.insert(memory)
+        try? modelContext.save()
+
+        let headings = route.routeHeadings
+        let stepDistance = route.stepDistance
+        var truthLocation = start
+        var mixedLocation = start
+        var goodLocations: [CLLocation] = []
+        var mixedLocations: [CLLocation] = []
+        var mixedEstimatedCount = 0
+        let goodSegmentID = UUID()
+        var mixedSegmentID = UUID()
+        var inDrop = false
+
+        func stepSimulation(_ index: Int) {
+            guard index < headings.count else {
+                let metrics = benchmarkMetrics(good: goodLocations, mixed: mixedLocations)
+                let mixedEstimatedRatio = mixedLocations.isEmpty ? 0 : Int((Double(mixedEstimatedCount) / Double(mixedLocations.count)) * 100)
+                let mixedSegments = Set(memory.breadcrumbs.filter(\.isEstimated).compactMap(\.segmentID)).count
+                simulationStatus = "Overlay \(route.label): mean err \(Int(metrics.meanError))m, end err \(Int(metrics.endError))m, est \(mixedEstimatedRatio)%, seg \(max(1, mixedSegments))"
+                isRunningSimulation = false
+                try? modelContext.save()
+                return
+            }
+
+            let heading = headings[index]
+            let trueCoord = projectedCoordinate(
+                from: truthLocation.coordinate,
+                headingDegrees: heading,
+                distanceMeters: stepDistance
+            )
+            truthLocation = CLLocation(latitude: trueCoord.latitude, longitude: trueCoord.longitude)
+
+            let goodCoord = noisyCoordinate(base: trueCoord, index: index, maxNoiseMeters: 0.8)
+            let goodPoint = BreadcrumbPoint(
+                latitude: goodCoord.latitude,
+                longitude: goodCoord.longitude,
+                heading: heading,
+                stepDistance: stepDistance,
+                horizontalAccuracy: 8,
+                speed: 1.4,
+                course: heading,
+                altitude: start.altitude,
+                verticalAccuracy: 8,
+                verticalDelta: 0,
+                confidenceScore: 0.92,
+                segmentID: goodSegmentID,
+                isEstimated: false
+            )
+            memory.breadcrumbs.append(goodPoint)
+            goodLocations.append(goodPoint.location)
+
+            let stepNumber = index + 1
+            let shouldDrop = route.dropoutSteps.contains(stepNumber)
+            if shouldDrop {
+                if !inDrop {
+                    mixedSegmentID = UUID()
+                    inDrop = true
+                }
+                let offset = route.headingOffsets[index % route.headingOffsets.count]
+                let estimatedHeading = normalizeHeading(heading + offset)
+                let estimatedCoord = projectedCoordinate(
+                    from: mixedLocation.coordinate,
+                    headingDegrees: estimatedHeading,
+                    distanceMeters: stepDistance * 0.94
+                )
+                let mixedPoint = BreadcrumbPoint(
+                    latitude: estimatedCoord.latitude,
+                    longitude: estimatedCoord.longitude,
+                    heading: estimatedHeading,
+                    stepDistance: stepDistance * 0.94,
+                    horizontalAccuracy: nil,
+                    speed: nil,
+                    course: nil,
+                    altitude: start.altitude,
+                    verticalAccuracy: nil,
+                    verticalDelta: 0,
+                    confidenceScore: 0.28,
+                    segmentID: mixedSegmentID,
+                    isEstimated: true
+                )
+                memory.breadcrumbs.append(mixedPoint)
+                mixedLocations.append(mixedPoint.location)
+                mixedEstimatedCount += 1
+                mixedLocation = mixedPoint.location
+            } else {
+                if inDrop {
+                    mixedSegmentID = UUID()
+                    inDrop = false
+                }
+                let mixedCoord = noisyCoordinate(base: trueCoord, index: index + 1000, maxNoiseMeters: 2.8)
+                let mixedPoint = BreadcrumbPoint(
+                    latitude: mixedCoord.latitude,
+                    longitude: mixedCoord.longitude,
+                    heading: heading,
+                    stepDistance: stepDistance,
+                    horizontalAccuracy: 24,
+                    speed: 1.35,
+                    course: heading,
+                    altitude: start.altitude,
+                    verticalAccuracy: 10,
+                    verticalDelta: 0,
+                    confidenceScore: 0.64,
+                    segmentID: mixedSegmentID,
+                    isEstimated: false
+                )
+                memory.breadcrumbs.append(mixedPoint)
+                mixedLocations.append(mixedPoint.location)
+                mixedLocation = mixedPoint.location
+            }
+
+            try? modelContext.save()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                stepSimulation(index + 1)
+            }
+        }
+
+        stepSimulation(0)
     }
 
     private func runSimulationStep(
@@ -259,8 +507,15 @@ struct TimelineView: View {
                     step: step,
                     totalSteps: routeHeadings.count
                 )
+                let estimatedDistanceScale: Double = {
+                    switch profile {
+                    case .good: return 1.0
+                    case .mixed: return 0.96
+                    case .poor: return 0.9
+                    }
+                }()
                 BreadcrumbManager.shared.ingestSimulatedEstimatedMovement(
-                    distanceMeters: stepDistance * 0.92,
+                    distanceMeters: stepDistance * estimatedDistanceScale,
                     heading: estimatedHeading
                 )
                 }
@@ -303,12 +558,37 @@ struct TimelineView: View {
         return memory
     }
 
-    private func simulationRouteHeadings() -> [Double] {
-        // Pattern: straight, left, straight, right, straight, right, straight, left, straight.
-        // Repeat each segment twice and run two cycles for a longer walking scenario.
-        let basePattern: [Double] = [0, 90, 0, 270, 0, 270, 0, 90, 0]
-        let singleCycle = basePattern.flatMap { heading in [heading, heading] }
-        return singleCycle + singleCycle
+    private func simulationRouteHeadings(route: SimulationRoute) -> [Double] {
+        switch route {
+        case .cityBlocks:
+            // Grid-walk style turns.
+            let basePattern: [Double] = [0, 90, 90, 0, 270, 270, 0, 90, 0]
+            return basePattern.flatMap { [$0, $0] } + [0, 0, 90, 90]
+        case .curvedPark:
+            // Gradual bends like walking paths.
+            return [
+                0, 8, 15, 22, 30,
+                42, 55, 70, 82, 95,
+                102, 110, 118, 126, 134,
+                142, 150, 158, 165, 172,
+                180, 188, 196, 205, 214,
+                220, 226, 232, 238, 245
+            ]
+        case .outAndBack:
+            // Straight outward leg, turn-around arc, then return with slight drift.
+            let outward = Array(repeating: 0.0, count: 10)
+            let turnArc: [Double] = [20, 45, 75, 110, 145, 175]
+            let inbound = Array(repeating: 182.0, count: 10)
+            return outward + turnArc + inbound
+        }
+    }
+
+    private func simulationStepDistance(for route: SimulationRoute) -> Double {
+        switch route {
+        case .cityBlocks: return 4.8
+        case .curvedPark: return 4.2
+        case .outAndBack: return 5.0
+        }
     }
 
     private func simulatedAccuracy(for profile: SimulationProfile, step: Int, totalSteps: Int) -> Double {
@@ -330,14 +610,35 @@ struct TimelineView: View {
         }
     }
 
+    private func noisyCoordinate(
+        base: CLLocationCoordinate2D,
+        index: Int,
+        maxNoiseMeters: Double
+    ) -> CLLocationCoordinate2D {
+        let pseudo = sin(Double(index) * 1.73) * maxNoiseMeters
+        let heading = normalizeHeading(Double((index * 37) % 360))
+        return projectedCoordinate(from: base, headingDegrees: heading, distanceMeters: abs(pseudo))
+    }
+
+    private func benchmarkMetrics(good: [CLLocation], mixed: [CLLocation]) -> (meanError: Double, endError: Double) {
+        let paired = min(good.count, mixed.count)
+        guard paired > 0 else { return (0, 0) }
+        let total = (0..<paired).reduce(0.0) { sum, i in
+            sum + good[i].distance(from: mixed[i])
+        }
+        let mean = total / Double(paired)
+        let end = good[paired - 1].distance(from: mixed[paired - 1])
+        return (mean, end)
+    }
+
     private func shouldDropSignal(for profile: SimulationProfile, step: Int, totalSteps: Int) -> Bool {
         let progress = Double(step) / Double(max(totalSteps, 1))
         switch profile {
         case .good:
             return false
         case .mixed:
-            if progress < 0.35 { return [5, 9, 12].contains(step) }
-            if progress < 0.7 { return [18, 23].contains(step) }
+            if progress < 0.35 { return [6, 11].contains(step) }
+            if progress < 0.7 { return [18].contains(step) }
             return false
         case .poor:
             if progress < 0.5 { return [4, 5, 8, 9, 12, 13, 16].contains(step) }
@@ -360,7 +661,7 @@ struct TimelineView: View {
         case .good:
             return trueHeading
         case .mixed:
-            let offsets: [Double] = [-8, -4, 0, 4, 7]
+            let offsets: [Double] = [-5, -2, 0, 2, 4]
             return normalizeHeading(trueHeading + offsets[step % offsets.count])
         case .poor:
             let offsets: [Double] = progress < 0.7
@@ -818,4 +1119,78 @@ struct ManualMemorySheet: View {
 private struct PinAnnotation: Identifiable {
     let id = UUID()
     let coordinate: CLLocationCoordinate2D
+}
+
+struct EditMemorySheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let memory: MemoryNode
+    let modelContext: ModelContext
+
+    @State private var name: String
+    @State private var notes: String
+    @State private var classification: String
+    @State private var showValidationError = false
+    @State private var validationMessage = ""
+
+    private let classificationOptions = [
+        "parking", "luggage", "food", "shop", "document", "person", "place", "memory"
+    ]
+
+    init(memory: MemoryNode, modelContext: ModelContext) {
+        self.memory = memory
+        self.modelContext = modelContext
+        _name = State(initialValue: memory.smartLabel)
+        _notes = State(initialValue: memory.detectedText.first ?? "")
+        _classification = State(initialValue: memory.classification)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Details") {
+                    TextField("Label", text: $name)
+                    TextField("Notes", text: $notes, axis: .vertical)
+                        .lineLimit(3...6)
+                    Picker("Category", selection: $classification) {
+                        ForEach(classificationOptions, id: \.self) { option in
+                            Text(option.capitalized).tag(option)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Edit Memory")
+            .navigationBarTitleDisplayMode(.inline)
+            .alert("Invalid input", isPresented: $showValidationError) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(validationMessage)
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save() }
+                }
+            }
+        }
+    }
+
+    private func save() {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            validationMessage = "Label cannot be empty."
+            showValidationError = true
+            return
+        }
+
+        memory.smartLabel = trimmedName
+        memory.classification = classification
+        let trimmedNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        memory.detectedText = trimmedNotes.isEmpty ? [] : [trimmedNotes]
+
+        try? modelContext.save()
+        dismiss()
+    }
 }
