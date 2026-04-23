@@ -20,25 +20,92 @@ struct CaptureView: View {
     
     var body: some View {
         ZStack {
-            CameraPreview(camera: camera)
+            Color.black
                 .ignoresSafeArea()
+
+            CameraPreview(camera: camera)
+                .ignoresSafeArea(edges: [.top, .horizontal])
+                .scaleEffect(0.95)
+                .offset(y: -4)
+                .padding(.bottom, 58)
+                .overlay(alignment: .bottom) {
+                    LinearGradient(
+                        colors: [
+                            .clear,
+                            .black.opacity(0.22),
+                            .black.opacity(0.52),
+                            .black.opacity(0.82),
+                            .black.opacity(0.95),
+                            .black
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 170)
+                }
             
             VStack {
                 Spacer()
-                
-                Button {
-                    capture()
-                } label: {
-                    ZStack {
-                        Circle()
-                            .fill(.white)
-                            .frame(width: 80, height: 80)
-                        Circle()
-                            .stroke(.white.opacity(0.4), lineWidth: 4)
-                            .frame(width: 94, height: 94)
+
+                ZStack(alignment: .top) {
+                    RoundedRectangle(cornerRadius: 36, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 36, style: .continuous)
+                                .stroke(.white.opacity(0.22), lineWidth: 1)
+                        }
+                        .shadow(color: .black.opacity(0.26), radius: 18, y: 6)
+                        .frame(height: 80)
+                        .padding(.horizontal, 68)
+
+                    HStack {
+                        Button {
+                        } label: {
+                            Image(systemName: camera.isTorchOn ? "bolt.fill" : "bolt.slash.fill")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(camera.isTorchOn ? .yellow : .white)
+                                .frame(width: 30, height: 30)
+                                .background(.black.opacity(0.35), in: Circle())
+                        }
+                        .disabled(!camera.supportsFlash)
+                        .simultaneousGesture(
+                            LongPressGesture(minimumDuration: 0.35)
+                                .onEnded { _ in
+                                    camera.toggleFlashFromLongPress()
+                                    let generator = UIImpactFeedbackGenerator(style: .medium)
+                                    generator.impactOccurred()
+                                }
+                        )
+
+                        Spacer()
+                        Button {
+                            camera.toggleWideZoom()
+                        } label: {
+                            Image(systemName: camera.isWideZoomMode ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(width: 30, height: 30)
+                                .background(.black.opacity(0.35), in: Circle())
+                        }
                     }
+                    .padding(.horizontal, 90)
+                    .padding(.top, 22)
+
+                    Button {
+                        capture()
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(.white)
+                                .frame(width: 80, height: 80)
+                            Circle()
+                                .stroke(.white.opacity(0.4), lineWidth: 4)
+                                .frame(width: 94, height: 94)
+                        }
+                    }
+                    .offset(y: -8)
                 }
-                .padding(.bottom, 40)
+                .padding(.bottom, 6)
             }
             
             if showSavedFeedback {
@@ -70,7 +137,7 @@ struct CaptureView: View {
             camera.stopSession()
         }
     }
-    
+
     private func capture() {
         camera.capturePhoto { imageData in
             guard let imageData,
@@ -172,22 +239,29 @@ struct CameraPreview: UIViewRepresentable {
     var videoGravity: AVLayerVideoGravity = .resizeAspectFill
 
     func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+        let view = PreviewContainerView()
         view.backgroundColor = .black
 
         let previewLayer = AVCaptureVideoPreviewLayer(session: camera.session)
         previewLayer.videoGravity = videoGravity
-        previewLayer.frame = view.bounds
 
+        view.previewLayer = previewLayer
         view.layer.addSublayer(previewLayer)
 
         context.coordinator.previewLayer = previewLayer
+        
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
+        view.addGestureRecognizer(tap)
+        let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePinch(_:)))
+        view.addGestureRecognizer(pinch)
+        context.coordinator.camera = camera
+        context.coordinator.containerView = view
         return view
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
-        DispatchQueue.main.async {
-            context.coordinator.previewLayer?.frame = uiView.bounds
+        if let previewView = uiView as? PreviewContainerView {
+            previewView.previewLayer?.videoGravity = videoGravity
         }
     }
 
@@ -197,5 +271,64 @@ struct CameraPreview: UIViewRepresentable {
 
     class Coordinator {
         var previewLayer: AVCaptureVideoPreviewLayer?
+        weak var camera: CameraManager?
+        weak var containerView: PreviewContainerView?
+        private var pinchStartZoom: CGFloat = 1.0
+        
+        @objc func handleTap(_ recognizer: UITapGestureRecognizer) {
+            guard let view = recognizer.view as? PreviewContainerView else { return }
+            let point = recognizer.location(in: view)
+            camera?.focus(at: point, previewLayer: previewLayer)
+            view.showFocusIndicator(at: point)
+        }
+
+        @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+            guard let camera else { return }
+            switch recognizer.state {
+            case .began:
+                pinchStartZoom = camera.zoomFactor
+            case .changed:
+                camera.setZoom(factor: pinchStartZoom * recognizer.scale)
+            default:
+                break
+            }
+        }
+    }
+}
+
+final class PreviewContainerView: UIView {
+    var previewLayer: AVCaptureVideoPreviewLayer?
+    
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        previewLayer?.frame = bounds
+    }
+    
+    func showFocusIndicator(at point: CGPoint) {
+        let size: CGFloat = 80
+        let indicator = UIView(frame: CGRect(
+            x: point.x - (size / 2),
+            y: point.y - (size / 2),
+            width: size,
+            height: size
+        ))
+        indicator.layer.borderColor = UIColor.white.withAlphaComponent(0.9).cgColor
+        indicator.layer.borderWidth = 1.5
+        indicator.layer.cornerRadius = 12
+        indicator.backgroundColor = .clear
+        indicator.alpha = 0
+        
+        addSubview(indicator)
+        
+        UIView.animate(withDuration: 0.15, animations: {
+            indicator.alpha = 1
+            indicator.transform = CGAffineTransform(scaleX: 0.9, y: 0.9)
+        }) { _ in
+            UIView.animate(withDuration: 0.25, delay: 0.45, options: [.curveEaseOut], animations: {
+                indicator.alpha = 0
+            }, completion: { _ in
+                indicator.removeFromSuperview()
+            })
+        }
     }
 }
