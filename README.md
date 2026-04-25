@@ -55,7 +55,9 @@ Field and simulation results show navigation quality varies by signal conditions
 - **Stable GPS:** smooth breadcrumb trail and reliable return path in tests.
 - **Mixed signal:** usable guidance with occasional drift; recovery improves after stronger updates return.
 - **Poor indoor signal:** currently inconsistent in real-world tests; directional guidance may remain usable, but path accuracy can degrade substantially.
-Simulation confirms fallback logic behavior, but under-represents indoor multipath/noise.  
+
+Simulation confirms fallback logic behavior, but under-represents indoor multipath/noise. 
+
 Current focus is tuning indoor fallback thresholds using repeated field runs.
 
 ## Run locally
