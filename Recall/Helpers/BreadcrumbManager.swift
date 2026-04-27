@@ -41,6 +41,8 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     private var pendingReliableSamples: Int = 0
     private var lastDeadReckonedDistance: Double = 0
     private var lastModeRecoveryAt: Date = .distantPast
+    private var lastGPSUpdateAt: Date?
+    private var consecutiveInvalidGPSSamples: Int = 0
     
     @Published private(set) var activeMemoryID: UUID?
     @Published private(set) var isTracking = false
@@ -52,19 +54,21 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     private let maxTrailDistance: Double = 1_500  // 1.5 km
     private let goodAccuracyThreshold: Double = 15 // clearly good GPS
     private let poorAccuracyThreshold: Double = 28 // clearly poor GPS
-    private let maxBreadcrumbAccuracy: Double = 65 // drop very noisy crumbs
-    private let maxHumanWalkingSpeed: Double = 4.5 // speed sanity
-    private let maxSingleJumpDistance: Double = 35 // jump rejection
-    private let minDistanceReliable: Double = 10
-    private let minDistanceDegrading: Double = 6
-    private let minDistanceUnreliable: Double = 4
-    private let minRecoverySamples = 2
-    private let segmentBreakAfterPoorSignal: TimeInterval = 18
+    private let maxBreadcrumbAccuracy: Double = 85 // allow outdoors with moderate noise
+    private let maxHumanWalkingSpeed: Double = 6.0 // less aggressive speed rejection
+    private let maxSingleJumpDistance: Double = 55 // less aggressive jump rejection
+    private let minDistanceReliable: Double = 8
+    private let minDistanceDegrading: Double = 5
+    private let minDistanceUnreliable: Double = 3
+    private let minRecoverySamples = 1
+    private let invalidSamplesBeforeFallback = 3
+    private let segmentBreakAfterPoorSignal: TimeInterval = 24
     private let maxDeadReckoningDuration: TimeInterval = 25
-    private let minDeadReckoningStepDistance: Double = 3
+    private let minDeadReckoningStepDistance: Double = 2.5
     private let maxDeadReckoningStepDistance: Double = 8
     private let postRecoverySegmentHold: TimeInterval = 8
-    private let minDisplacementForSegmentBreak: Double = 12
+    private let minDisplacementForSegmentBreak: Double = 16
+    private let gpsStaleIntervalForIndoorFallback: TimeInterval = 6
     
     override init() {
         super.init()
@@ -86,6 +90,8 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         self.pendingReliableSamples = 0
         self.lastDeadReckonedDistance = 0
         self.lastModeRecoveryAt = .distantPast
+        self.lastGPSUpdateAt = Date()
+        self.consecutiveInvalidGPSSamples = 0
         self.activeMemoryID = memory.id
         self.isTracking = true
         self.trackedDistance = 0
@@ -93,6 +99,9 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         self.trackingState = (memory.captureHorizontalAccuracy ?? 0) > poorAccuracyThreshold
             ? .trackingPoorGPS
             : .trackingNormal
+        if self.trackingState == .trackingPoorGPS {
+            self.poorSignalStartedAt = Date()
+        }
         
         manager.startUpdatingLocation()
         manager.startUpdatingHeading()
@@ -124,6 +133,8 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         pendingReliableSamples = 0
         lastDeadReckonedDistance = 0
         lastModeRecoveryAt = .distantPast
+        lastGPSUpdateAt = nil
+        consecutiveInvalidGPSSamples = 0
         deadReckoner.stop()
         activeMemoryID = nil
         isTracking = false
@@ -139,12 +150,31 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
               let lastLocation = lastRecordedLocation,
               let memory = activeMemory,
               let context = modelContext else { return }
+        lastGPSUpdateAt = Date()
         processLocationUpdate(
             newLocation: newLocation,
             lastLocation: lastLocation,
             memory: memory,
             context: context,
             headingFromManager: manager.heading?.trueHeading
+        )
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        guard isTracking,
+              let anchor = lastRecordedLocation,
+              let memory = activeMemory,
+              let context = modelContext else { return }
+        guard trackingState == .trackingPoorGPS else { return }
+        let secondsSinceGPS = Date().timeIntervalSince(lastGPSUpdateAt ?? .distantPast)
+        guard secondsSinceGPS >= gpsStaleIntervalForIndoorFallback else { return }
+        enterPoorSignalState()
+        let heading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+        maybeRecordDeadReckonedCrumb(
+            from: anchor,
+            memory: memory,
+            context: context,
+            fallbackHeading: heading
         )
     }
 
@@ -227,8 +257,16 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         let hasAcceptableSpeed = speed < 0 || speed <= maxHumanWalkingSpeed
         let hasAcceptableJump = distanceMoved <= maxSingleJumpDistance
         let isValidGPSCrumb = hasAcceptableAccuracy && hasAcceptableSpeed && hasAcceptableJump
+        let looksOutdoorReliable =
+            newLocation.horizontalAccuracy > 0 &&
+            newLocation.horizontalAccuracy <= poorAccuracyThreshold &&
+            (speed < 0 || speed <= (maxHumanWalkingSpeed + 0.8)) &&
+            distanceMoved <= (maxSingleJumpDistance + 20)
+        let shouldAcceptGPSCrumb = isValidGPSCrumb || looksOutdoorReliable
 
-        guard isValidGPSCrumb else {
+        guard shouldAcceptGPSCrumb else {
+            consecutiveInvalidGPSSamples += 1
+            guard consecutiveInvalidGPSSamples >= invalidSamplesBeforeFallback else { return }
             enterPoorSignalState()
             maybeRecordDeadReckonedCrumb(
                 from: lastLocation,
@@ -238,6 +276,7 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             )
             return
         }
+        consecutiveInvalidGPSSamples = 0
         
         let minimumDistanceForMode: Double
         switch navigationMode {
@@ -273,6 +312,7 @@ class BreadcrumbManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             deadReckoner.resetAnchor()
             lastDeadReckonedDistance = 0
             lastModeRecoveryAt = Date()
+            consecutiveInvalidGPSSamples = 0
         }
         
         let heading = currentHeading >= 0 ? currentHeading : 0
