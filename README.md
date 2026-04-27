@@ -4,6 +4,9 @@ Recall is an iOS app that lets you save a memory (photo + location) and navigate
 
 ![Recall preview](Recall/docs/recall-preview.png)
 
+
+[Demo Video](https://www.youtube.com/shorts/Bb99dfuGlN4)
+
 ## What it does
 
 - Capture a memory with photo + location context
@@ -67,10 +70,11 @@ Current focus is tuning indoor fallback thresholds using repeated field runs.
 3. Build and run the `Recall` target.
 
 
-## Current limitations (updated 26 April 2026)
+## Current limitations
 
 - Indoor/deep-parking navigation remains less reliable than outdoor routing.
 - Simulation performance is currently stronger than real-world indoor performance.
+- Vision needs improvements, often captures noise from background text.
 - Current focus: tuning fallback thresholds using repeated parking-to-mall field runs.
 
 ## Demo video notes
