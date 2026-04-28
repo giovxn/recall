@@ -15,16 +15,6 @@ Recall is an iOS app that lets you save a memory (photo + location) and navigate
 - Navigate back using distance, heading, and a breadcrumb trail
 - Maintain usable guidance under weak or noisy GPS
 
-## Key idea
-
-Traditional navigation assumes GPS is reliable.
-
-Recall instead treats location as uncertain:
-- records breadcrumb trails over time
-- uses movement + heading to guide direction
-- adapts behavior when signal quality drops
-- refines paths when better GPS becomes available
-
 ## Tech stack
 
 - SwiftUI
@@ -45,13 +35,31 @@ Low-level architecture:
 
 <img src="Recall/docs/recall-low-level.png" alt="Recall low-level architecture" width="700" />
 
+
+## Key idea
+I initially assumed saving a photo, GPS location, and breadcrumb trail would be enough to help someone return to where they left something.
+
+It wasn’t.
+
+Indoor spaces, parking structures, and weak signal areas made it obvious how quickly GPS drift and heading noise break naive navigation. Even breadcrumb trails became unreliable when built directly from raw GPS, causing paths to jump and direction guidance to feel wrong.
+
+## What failed first
+My first implementation assumed saving a GPS coordinate and showing distance + bearing would be enough.
+In practice, indoor signal drift made this unreliable:
+- saved locations could be off by 20–40m
+- heading frequently jumped while standing still
+- distance often looked correct while direction was wrong
+
+This made “simple navigation” feel broken.
+That led to breadcrumb tracking + fallback navigation instead of relying on a single saved coordinate.
+
 ## Engineering approach
-Instead of assuming location is always correct, Recall treats positioning as uncertain and adapts in real time by:
-- tracking breadcrumb history rather than a single point
-- scoring location confidence from signal quality/motion stability
-- switching navigation behavior as confidence changes
-- using estimated movement fallback during weak/absent GPS windows
-- refining guidance once stronger GPS returns
+Instead of relying on a single saved coordinate, Recall adapts navigation in real time by:
+- tracking breadcrumb history over time rather than a fixed point
+- estimating confidence from GPS consistency and heading stability
+- switching navigation behavior when signal quality drops
+- using fallback movement estimation during weak/absent GPS windows
+- refining guidance when stronger location updates return
 
 ## Experiments / Observations
 Field and simulation results show navigation quality varies by signal conditions:
