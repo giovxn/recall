@@ -36,7 +36,6 @@ Low-level architecture:
 <img src="Recall/docs/recall-low-level.png" alt="Recall low-level architecture" width="700" />
 
 
-## Key idea
 I initially assumed saving a photo, GPS location, and breadcrumb trail would be enough to help someone return to where they left something.
 
 It wasn’t.
