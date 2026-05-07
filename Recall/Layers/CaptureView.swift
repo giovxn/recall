@@ -17,6 +17,10 @@ struct CaptureView: View {
     @StateObject private var camera = CameraManager()
     
     @State private var showSavedFeedback = false
+    #if DEBUG
+    @State private var showDebugShareSheet = false
+    @State private var debugShareURL: URL?
+    #endif
     
     var body: some View {
         ZStack {
@@ -124,6 +128,41 @@ struct CaptureView: View {
             if camera.authorizationStatus != .authorized {
                 cameraPermissionOverlay
             }
+
+            #if DEBUG
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 6) {
+                        Button("Run Batch") {
+                            VisionAnalyzer.runDebugBatch()
+                        }
+                        .font(.system(size: 10, weight: .medium))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(.black.opacity(0.45), in: Capsule())
+                        .foregroundStyle(.white.opacity(0.8))
+
+                        Button("Export Log") {
+                            if let url = VisionAnalyzer.debugLogFileURL() {
+                                debugShareURL = url
+                                showDebugShareSheet = true
+                            } else {
+                                print("DEBUG EXPORT — vision_log.json not found")
+                            }
+                        }
+                        .font(.system(size: 10, weight: .medium))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(.black.opacity(0.45), in: Capsule())
+                        .foregroundStyle(.white.opacity(0.8))
+                    }
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 120)
+                }
+            }
+            #endif
         }
         .onAppear {
             locationManager.requestPermission()
@@ -134,6 +173,13 @@ struct CaptureView: View {
         .onDisappear {
             camera.stopSession()
         }
+        #if DEBUG
+        .sheet(isPresented: $showDebugShareSheet) {
+            if let debugShareURL {
+                ShareSheet(activityItems: [debugShareURL])
+            }
+        }
+        #endif
     }
 
     private func capture() {
@@ -231,6 +277,18 @@ struct CaptureView: View {
         }
     }
 }
+
+#if DEBUG
+private struct ShareSheet: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+#endif
 
 struct CameraPreview: UIViewRepresentable {
     let camera: CameraManager

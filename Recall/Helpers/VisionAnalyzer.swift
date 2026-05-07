@@ -1,6 +1,7 @@
 import Vision
 import UIKit
 import CoreImage
+import Foundation
 
 struct MemoryAnalysis {
     var classification: String
@@ -13,10 +14,23 @@ class VisionAnalyzer {
     static let shared = VisionAnalyzer()
     private let ocrMinConfidence: Float = 0.55
     private let ocrFallbackConfidence: Float = 0.28
+    #if DEBUG
+    private static let debugLogQueue = DispatchQueue(label: "recall.vision.debugLogQueue")
+    #endif
     
     func analyze(imageData: Data, completion: @escaping (MemoryAnalysis) -> Void) {
         guard let uiImage = UIImage(data: imageData),
-              let cgImage = uiImage.cgImage else { return }
+              let cgImage = uiImage.cgImage else {
+            completion(
+                MemoryAnalysis(
+                    classification: "memory",
+                    smartLabel: "Memory",
+                    detectedText: [],
+                    dominantColor: .systemBlue
+                )
+            )
+            return
+        }
         
         var classification = "memory"
         var detectedText: [String] = []
@@ -67,6 +81,13 @@ class VisionAnalyzer {
             } else if let inferredFromText = Self.inferClassification(fromText: detectedText) {
                 classification = inferredFromText
             }
+            #if DEBUG
+            Self.logDebugAnalysis(
+                textWithSizes: textWithSizes,
+                smartLabel: smartLabel,
+                classification: classification
+            )
+            #endif
             let analysis = MemoryAnalysis(
                 classification: classification,
                 smartLabel: smartLabel,
@@ -132,8 +153,43 @@ class VisionAnalyzer {
             text.range(of: pattern, options: .regularExpression) != nil
         }
 
+        // Strong deterministic pass: if a parking row marker like P1/B5 is visible, prioritize it.
+        let rowMarkers = normalizedItems
+            .filter { regexMatch($0.text, "^[PGBL][0-9]{1,3}$") }
+            .sorted { $0.size > $1.size }
+        let rowSuffixCandidates = normalizedItems
+            .filter { item in
+                regexMatch(item.text, "^[A-Z]{1,2}$")
+                    && !parkingStopWords.contains(item.text)
+                    && !emirates.contains(item.text)
+            }
+            .sorted { $0.size > $1.size }
+        if let bestRow = rowMarkers.first {
+            if let suffix = rowSuffixCandidates.first,
+               suffix.size >= (bestRow.size * 0.35) {
+                return "Parking · \(bestRow.text) \(suffix.text)"
+            }
+            return "Parking · \(bestRow.text)"
+        }
+
         // 1) Parking-first candidates (highest priority)
         var parkingCandidates: [(value: String, score: Double)] = []
+
+        // Handle split marker tokens such as "P1" + "H" from adjacent OCR items.
+        if normalizedItems.count >= 2 {
+            for i in 0..<(normalizedItems.count - 1) {
+                let left = normalizedItems[i]
+                let right = normalizedItems[i + 1]
+                let leftLooksLikeRow = regexMatch(left.text, "^[PGBL][0-9]{1,3}$")
+                let rightLooksLikeSuffix = regexMatch(right.text, "^[A-Z]{1,2}$")
+                if leftLooksLikeRow && rightLooksLikeSuffix && !parkingStopWords.contains(right.text) {
+                    let combined = "\(left.text) \(right.text)"
+                    let score = (Double(left.size) + Double(right.size)) * 100 + 58
+                    parkingCandidates.append((value: combined, score: score))
+                }
+            }
+        }
+
         for item in normalizedItems {
             let text = item.text
             if parkingStopWords.contains(text) { continue }
@@ -212,7 +268,8 @@ class VisionAnalyzer {
             return "Parking · \(bestLetters) \(bestNumber)"
         }
         if digits >= 4 { return bestNumber }
-        if digits <= 3 { return "Parking · \(bestNumber)" }
+        // Avoid treating short pure numbers as parking anchors (often plate fragments).
+        if digits <= 3 { return nil }
         return nil
     }
     
@@ -376,4 +433,89 @@ class VisionAnalyzer {
         UIGraphicsEndImageContext()
         return resized
     }
+
+    #if DEBUG
+    private struct DebugVisionLogEntry: Codable {
+        struct OCRItem: Codable {
+            let text: String
+            let size: Float
+        }
+
+        let timestamp: String
+        let textWithSizes: [OCRItem]
+        let smartLabel: String
+        let classification: String
+    }
+
+    private static func logDebugAnalysis(
+        textWithSizes: [(text: String, size: CGFloat)],
+        smartLabel: String,
+        classification: String
+    ) {
+        let entry = DebugVisionLogEntry(
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            textWithSizes: textWithSizes.map {
+                .init(text: $0.text, size: Float($0.size))
+            },
+            smartLabel: smartLabel,
+            classification: classification
+        )
+
+        debugLogQueue.async {
+            let fileManager = FileManager.default
+            guard let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
+                return
+            }
+            let logURL = documentsURL.appendingPathComponent("vision_log.json")
+
+            var entries: [DebugVisionLogEntry] = []
+            if fileManager.fileExists(atPath: logURL.path),
+               let data = try? Data(contentsOf: logURL),
+               let decoded = try? JSONDecoder().decode([DebugVisionLogEntry].self, from: data) {
+                entries = decoded
+            }
+
+            entries.append(entry)
+            guard let encoded = try? JSONEncoder().encode(entries) else { return }
+            try? encoded.write(to: logURL, options: .atomic)
+        }
+    }
+
+    static func runDebugBatch() {
+        // TODO: Add park_001.jpg through park_047.jpg to the Xcode project bundle before running.
+        let filenames = (1...47).map { String(format: "park_%03d", $0) }
+        print("DEBUG BATCH START — processing \(filenames.count) images")
+
+        func processNext(at index: Int) {
+            guard index < filenames.count else {
+                print("DEBUG BATCH COMPLETE — vision_log.json written")
+                return
+            }
+
+            let name = filenames[index]
+            guard let url = Bundle.main.url(forResource: name, withExtension: "jpg"),
+                  let imageData = try? Data(contentsOf: url) else {
+                print("DEBUG BATCH SKIP — missing or unreadable \(name).jpg")
+                processNext(at: index + 1)
+                return
+            }
+            print("DEBUG BATCH \(index + 1)/\(filenames.count) — \(name).jpg")
+
+            VisionAnalyzer.shared.analyze(imageData: imageData) { _ in
+                processNext(at: index + 1)
+            }
+        }
+
+        processNext(at: 0)
+    }
+
+    static func debugLogFileURL() -> URL? {
+        let fileManager = FileManager.default
+        guard let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let logURL = documentsURL.appendingPathComponent("vision_log.json")
+        return fileManager.fileExists(atPath: logURL.path) ? logURL : nil
+    }
+    #endif
 }
