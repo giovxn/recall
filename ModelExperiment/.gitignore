@@ -1,0 +1,14 @@
+# Large / private assets — keep on disk locally; do not commit
+**/*.jpg
+**/*.JPG
+**/*.jpeg
+**/*.png
+**/*.mp4
+**/*.mov
+
+.DS_Store
+**/.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
