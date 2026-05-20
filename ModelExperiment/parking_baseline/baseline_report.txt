@@ -2,13 +2,13 @@
 ════════════════════════════════════════
   BASELINE EVAL — VisionAnalyzer Heuristic
 ════════════════════════════════════════
-  Total images evaluated : 47
+  Total images evaluated : 84
   Null / unannotated     : 2
-  Scoreable              : 45
+  Scoreable              : 82
 
-  Exact match accuracy   : 0/45  (0.0%)
+  Exact match accuracy   : 0/82  (0.0%)
 
-  Failures (45 images):
+  Failures (82 images):
     park_001  true='Parking · P5 B'  got='Memory'
     park_002  true='Parking · C6'  got='Memory'
     park_003  true='Parking · D04'  got='Memory'
@@ -54,4 +54,41 @@
     park_044  true='Parking · P1 H'  got='Memory'
     park_046  true='Parking · B5'  got='Parking · O33'
     park_047  true='Parking · B5'  got='Memory'
+    park_048  true='Parking · 32'  got='Memory'
+    park_049  true='Parking · C8'  got='Memory'
+    park_050  true='Parking · 50'  got='Memory'
+    park_051  true='Parking · P1 H'  got='Memory'
+    park_052  true='Parking · 27'  got='Memory'
+    park_053  true='Parking · I05'  got='Memory'
+    park_054  true='Parking · I03'  got='Parking · A 9'
+    park_055  true='Parking · H03'  got='Memory'
+    park_056  true='Parking · H03'  got='Memory'
+    park_057  true='Parking · H02'  got='Memory'
+    park_058  true='Parking · I02'  got='Memory'
+    park_059  true='Parking · I01'  got='Memory'
+    park_060  true='Parking · P3'  got='Parking · ATT 1'
+    park_061  true='Parking · P1'  got='Memory'
+    park_062  true='Parking · P2'  got='Memory'
+    park_063  true='Parking · P3'  got='Memory'
+    park_064  true='Parking · P1 E3'  got='Memory'
+    park_065  true='Parking · P1 E4'  got='Memory'
+    park_066  true='Parking · P1 F2'  got='Memory'
+    park_067  true='Parking · P1 E2'  got='Memory'
+    park_068  true='Parking · P1 E1'  got='Memory'
+    park_069  true='Parking · P1 A11'  got='Memory'
+    park_070  true='Parking · P1 A10'  got='Memory'
+    park_071  true='Parking · 13'  got='Memory'
+    park_072  true='Parking · 13'  got='Memory'
+    park_073  true='Parking · 13'  got='Parking · T 1'
+    park_074  true='Parking · 12'  got='Memory'
+    park_075  true='Parking · 12'  got='Memory'
+    park_076  true='Parking · 10'  got='Memory'
+    park_077  true='Parking · 14'  got='Memory'
+    park_078  true='Parking · 08'  got='Memory'
+    park_079  true='Parking · 07'  got='Memory'
+    park_080  true='Parking · 06'  got='Memory'
+    park_081  true='Parking · 07'  got='Memory'
+    park_082  true='Parking · 06'  got='Memory'
+    park_083  true='Parking · 05'  got='Memory'
+    park_084  true='Parking · 04'  got='Memory'
 ════════════════════════════════════════
