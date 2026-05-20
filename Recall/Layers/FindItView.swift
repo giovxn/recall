@@ -881,18 +881,29 @@ struct BreadcrumbMapView: UIViewRepresentable {
         var current: [CLLocationCoordinate2D] = []
         var currentSegmentID: UUID?
         var hasEstimated = false
+        var previousCoordinate: CLLocationCoordinate2D?
+        let bridgeGapMeters: Double = 14
 
         for crumb in memory.breadcrumbs {
             let crumbSegmentID = crumb.segmentID
-            if !current.isEmpty, crumbSegmentID != currentSegmentID {
+            let currentCoordinate = CLLocationCoordinate2D(latitude: crumb.latitude, longitude: crumb.longitude)
+            let shouldBridgeGap: Bool = {
+                guard let previousCoordinate, crumbSegmentID != currentSegmentID else { return false }
+                let previousLocation = CLLocation(latitude: previousCoordinate.latitude, longitude: previousCoordinate.longitude)
+                let currentLocation = CLLocation(latitude: currentCoordinate.latitude, longitude: currentCoordinate.longitude)
+                return previousLocation.distance(from: currentLocation) <= bridgeGapMeters
+            }()
+
+            if !current.isEmpty, crumbSegmentID != currentSegmentID, !shouldBridgeGap {
                 segments.append(TrailSegment(coordinates: current, containsEstimated: hasEstimated))
                 current = []
                 hasEstimated = false
             }
 
-            current.append(CLLocationCoordinate2D(latitude: crumb.latitude, longitude: crumb.longitude))
+            current.append(currentCoordinate)
             currentSegmentID = crumbSegmentID
             hasEstimated = hasEstimated || crumb.isEstimated
+            previousCoordinate = currentCoordinate
         }
 
         if !current.isEmpty {
