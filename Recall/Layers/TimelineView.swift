@@ -101,6 +101,10 @@ struct TimelineView: View {
                             runDebugSimulation(.mixed, route: .outAndBack)
                         }
                         .disabled(isRunningSimulation)
+                        Button("Run indoor blackout simulation (no GPS)") {
+                            runIndoorBlackoutSimulation()
+                        }
+                        .disabled(isRunningSimulation)
                         Divider()
                         Button("Benchmark: underground parking (good vs mixed)") {
                             runOverlayComparisonSimulation(.parkingExitSimple)
@@ -334,6 +338,57 @@ struct TimelineView: View {
             stepDistance: stepDistance,
             startTime: startTime
         )
+    }
+
+    private func runIndoorBlackoutSimulation() {
+        guard !isRunningSimulation else { return }
+        guard let start = locationManager.currentLocation else {
+            simulationStatus = "Indoor blackout failed: no current location"
+            return
+        }
+
+        isRunningSimulation = true
+        simulationStatus = "Running indoor blackout simulation (no GPS)..."
+
+        let memory = makeSimulationMemory(from: start, profile: .poor)
+        memory.smartLabel = "Simulation - indoor blackout"
+        modelContext.insert(memory)
+        try? modelContext.save()
+        BreadcrumbManager.shared.start(for: memory, context: modelContext)
+
+        // Simulate heading/motion-only indoor movement with no GPS location updates.
+        let headings: [Double] = [
+            0, 0, 10, 20, 35, 55, 70, 85, 90, 90,
+            100, 115, 130, 145, 160, 180, 200, 215, 230, 245,
+            260, 275, 290, 305, 320, 335, 350, 0
+        ]
+        let stepDistance: Double = 3.8
+        let startTime = Date()
+
+        func runStep(_ index: Int) {
+            guard index < headings.count else {
+                let elapsed = Int(Date().timeIntervalSince(startTime))
+                let crumbs = memory.breadcrumbs.count
+                let estimated = memory.breadcrumbs.filter(\.isEstimated).count
+                simulationStatus = "Indoor blackout done: \(crumbs) crumbs, \(estimated) est, \(elapsed)s"
+                BreadcrumbManager.shared.stop(reason: .manual)
+                isRunningSimulation = false
+                try? modelContext.save()
+                return
+            }
+
+            let heading = headings[index]
+            BreadcrumbManager.shared.ingestSimulatedEstimatedMovement(
+                distanceMeters: stepDistance,
+                heading: heading
+            )
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                runStep(index + 1)
+            }
+        }
+
+        runStep(0)
     }
 
     private func runOverlayComparisonSimulation(_ route: OverlayRoute) {
