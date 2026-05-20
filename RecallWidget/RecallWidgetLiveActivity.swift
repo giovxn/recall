@@ -56,39 +56,17 @@ struct RecallWidgetLiveActivity: Widget {
             .activityBackgroundTint(backgroundColor(hex: context.state.bgHex).opacity(0.18))
             .activitySystemActionForegroundColor(.white)
 
-        } dynamicIsland: { context in
+        } dynamicIsland: { _ in
             DynamicIsland {
-                DynamicIslandExpandedRegion(.leading) {
-                    Image(systemName: "arrow.up")
-                        .foregroundStyle(.white)
-                        .rotationEffect(.degrees(context.state.rotationDegrees))
-                        .padding(.leading, 12)
-                        .padding(.top, 8)
-                }
-                DynamicIslandExpandedRegion(.trailing) {
-                    Text(context.state.distanceText)
-                        .font(.system(size: 14, weight: .bold))
-                        .padding(.trailing, 12)
-                        .padding(.top, 8)
-                }
-                DynamicIslandExpandedRegion(.bottom) {
-                    Text("\(context.state.directionText) • GPS \(context.state.gpsLevel)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.bottom, 8)
+                DynamicIslandExpandedRegion(.center) {
+                    EmptyView()
                 }
             } compactLeading: {
-                Image(systemName: "arrow.up")
-                    .rotationEffect(.degrees(context.state.rotationDegrees))
-                    .padding(.leading, 4)
+                EmptyView()
             } compactTrailing: {
-                Text(context.state.distanceText)
-                    .font(.caption)
-                    .lineLimit(1)
-                    .padding(.trailing, 4)
+                EmptyView()
             } minimal: {
-                Image(systemName: "arrow.up")
-                    .rotationEffect(.degrees(context.state.rotationDegrees))
+                EmptyView()
             }
         }
     }
